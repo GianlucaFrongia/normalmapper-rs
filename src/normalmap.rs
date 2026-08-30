@@ -2,9 +2,10 @@
 
 use image::{Rgba, RgbaImage};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 /// Which part of the source image is treated as height information.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum HeightSource {
     Luminance,
     Average,
@@ -49,7 +50,7 @@ impl HeightSource {
 }
 
 /// Edge-detection kernel used to differentiate the height field.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Kernel {
     Sobel,
     Scharr,
@@ -87,7 +88,8 @@ impl Kernel {
 }
 
 /// Every knob the generator exposes to the UI.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub source: HeightSource,
     pub kernel: Kernel,
@@ -103,6 +105,17 @@ pub struct Settings {
     pub flip_y: bool,
     /// Sample across the borders so the result tiles seamlessly.
     pub tileable: bool,
+
+    /// Horizon search radius in pixels for ambient occlusion; 0 disables it.
+    pub ao_radius: f32,
+    /// How much of the computed occlusion to keep.
+    pub ao_strength: f32,
+
+    /// Roughness value for perfectly smooth areas.
+    pub roughness_base: f32,
+    /// How strongly fine height detail pushes roughness up.
+    pub roughness_detail: f32,
+    pub roughness_invert: bool,
 }
 
 impl Default for Settings {
@@ -117,8 +130,73 @@ impl Default for Settings {
             flip_x: false,
             flip_y: false,
             tileable: false,
+            ao_radius: 8.0,
+            ao_strength: 1.0,
+            roughness_base: 0.4,
+            roughness_detail: 8.0,
+            roughness_invert: false,
         }
     }
+}
+
+/// One of the texture maps the generator can produce.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum MapKind {
+    Height,
+    Normal,
+    Ao,
+    Roughness,
+}
+
+impl MapKind {
+    pub const ALL: [MapKind; 4] = [
+        MapKind::Height,
+        MapKind::Normal,
+        MapKind::Ao,
+        MapKind::Roughness,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MapKind::Height => "Height",
+            MapKind::Normal => "Normal",
+            MapKind::Ao => "AO",
+            MapKind::Roughness => "Roughness",
+        }
+    }
+
+    /// Filename suffix used by the exporters, e.g. `brick_normal.png`.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            MapKind::Height => "height",
+            MapKind::Normal => "normal",
+            MapKind::Ao => "ao",
+            MapKind::Roughness => "roughness",
+        }
+    }
+}
+
+/// Render one map from an already-extracted height field.
+pub fn render(hm: &HeightMap, settings: &Settings, kind: MapKind) -> RgbaImage {
+    match kind {
+        MapKind::Height => hm.to_rgba(),
+        MapKind::Normal => normal_map(hm, settings),
+        MapKind::Ao => ambient_occlusion(hm, settings),
+        MapKind::Roughness => roughness(hm, settings),
+    }
+}
+
+/// Extract the height field once and render every requested map from it.
+pub fn generate(
+    src: &RgbaImage,
+    settings: &Settings,
+    kinds: &[MapKind],
+) -> Vec<(MapKind, RgbaImage)> {
+    let hm = height_map(src, settings);
+    kinds
+        .iter()
+        .map(|&k| (k, render(&hm, settings, k)))
+        .collect()
 }
 
 /// A single-channel f32 image.
@@ -172,7 +250,11 @@ pub fn height_map(src: &RgbaImage, settings: &Settings) -> HeightMap {
         data = gaussian_blur(&data, width, height, settings.blur, settings.tileable);
     }
 
-    HeightMap { width, height, data }
+    HeightMap {
+        width,
+        height,
+        data,
+    }
 }
 
 /// Turn a height field into a tangent-space normal map.
@@ -218,6 +300,83 @@ pub fn normal_map(hm: &HeightMap, settings: &Settings) -> RgbaImage {
         });
 
     RgbaImage::from_raw(w, h, buf).expect("buffer matches dimensions")
+}
+
+/// Horizon-based ambient occlusion over the height field.
+///
+/// For each pixel we march outwards in eight directions, track the steepest
+/// slope seen (the horizon angle), and treat its sine as the fraction of that
+/// direction's sky that is blocked.
+pub fn ambient_occlusion(hm: &HeightMap, settings: &Settings) -> RgbaImage {
+    const DIRS: usize = 8;
+    let (w, h) = (hm.width, hm.height);
+    let radius = settings.ao_radius;
+    if radius <= 0.0 || settings.ao_strength <= 0.0 {
+        return RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]));
+    }
+
+    let steps = (radius.ceil() as i32).clamp(1, 48);
+    let step_len = radius / steps as f32;
+    let depth = settings.strength.max(0.001);
+    let dirs: Vec<(f32, f32)> = (0..DIRS)
+        .map(|d| {
+            let a = d as f32 * std::f32::consts::TAU / DIRS as f32;
+            (a.cos(), a.sin())
+        })
+        .collect();
+
+    let mut buf = vec![0u8; w as usize * h as usize * 4];
+    buf.par_chunks_mut(w as usize * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..w as usize {
+                let h0 = hm.get(x as i32, y as i32, settings.tileable);
+                let mut occ = 0.0;
+                for &(cs, sn) in &dirs {
+                    let mut horizon = 0.0f32;
+                    for s in 1..=steps {
+                        let dist = s as f32 * step_len;
+                        let sx = (x as f32 + cs * dist).round() as i32;
+                        let sy = (y as f32 + sn * dist).round() as i32;
+                        let dh = (hm.get(sx, sy, settings.tileable) - h0) * depth;
+                        horizon = horizon.max(dh / dist);
+                    }
+                    // sin(atan(slope)) — the blocked share of that direction.
+                    occ += horizon / (horizon * horizon + 1.0).sqrt();
+                }
+                let ao = (1.0 - (occ / DIRS as f32) * settings.ao_strength).clamp(0.0, 1.0);
+                let c = (ao * 255.0).round() as u8;
+                let o = x * 4;
+                row[o] = c;
+                row[o + 1] = c;
+                row[o + 2] = c;
+                row[o + 3] = 255;
+            }
+        });
+
+    RgbaImage::from_raw(w, h, buf).expect("buffer matches dimensions")
+}
+
+/// Radius of the low-pass used to isolate fine detail for the roughness map.
+const ROUGHNESS_HIGHPASS: f32 = 3.0;
+
+/// Roughness from local height detail: flat areas keep the base value, busy
+/// areas are pushed towards 1.
+pub fn roughness(hm: &HeightMap, settings: &Settings) -> RgbaImage {
+    let (w, h) = (hm.width, hm.height);
+    let smooth = gaussian_blur(&hm.data, w, h, ROUGHNESS_HIGHPASS, settings.tileable);
+
+    let mut out = RgbaImage::new(w, h);
+    for (px, (&v, &s)) in out.pixels_mut().zip(hm.data.iter().zip(smooth.iter())) {
+        let detail = (v - s).abs() * settings.roughness_detail;
+        let mut r = (settings.roughness_base + detail).clamp(0.0, 1.0);
+        if settings.roughness_invert {
+            r = 1.0 - r;
+        }
+        let c = (r * 255.0).round() as u8;
+        *px = Rgba([c, c, c, 255]);
+    }
+    out
 }
 
 #[inline]
@@ -322,13 +481,78 @@ mod tests {
         let a = normal_map(&height_map(&img, &gl), &gl).get_pixel(4, 4).0[1];
         let b = normal_map(&height_map(&img, &dx), &dx).get_pixel(4, 4).0[1];
         // Equal and opposite, up to one step of rounding.
-        assert!(((a as i32 - 128) - (128 - b as i32)).abs() <= 1, "{a} vs {b}");
-        assert!((a as i32 - 128).abs() > 8, "expected a real Y tilt, got {a}");
+        assert!(
+            ((a as i32 - 128) - (128 - b as i32)).abs() <= 1,
+            "{a} vs {b}"
+        );
+        assert!(
+            (a as i32 - 128).abs() > 8,
+            "expected a real Y tilt, got {a}"
+        );
+    }
+
+    #[test]
+    fn flat_surface_is_unoccluded() {
+        let s = Settings::default();
+        let hm = height_map(&solid(24, 24, 90), &s);
+        for px in ambient_occlusion(&hm, &s).pixels() {
+            assert_eq!(px.0, [255, 255, 255, 255]);
+        }
+    }
+
+    #[test]
+    fn a_pit_is_darker_than_its_rim() {
+        // A single deep hole in the middle of a flat plate.
+        let mut img = solid(32, 32, 255);
+        for y in 14..18 {
+            for x in 14..18 {
+                img.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+            }
+        }
+        let s = Settings {
+            ao_radius: 10.0,
+            ..Settings::default()
+        };
+        let ao = ambient_occlusion(&height_map(&img, &s), &s);
+        assert!(
+            ao.get_pixel(16, 16).0[0] < ao.get_pixel(1, 1).0[0],
+            "the pit floor should be occluded"
+        );
+    }
+
+    #[test]
+    fn roughness_tracks_detail() {
+        let s = Settings::default();
+        // Checkerboard noise on the left half, flat on the right.
+        let mut img = solid(32, 16, 128);
+        for y in 0..16 {
+            for x in 0..16 {
+                let v = if (x + y) % 2 == 0 { 0 } else { 255 };
+                img.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        let r = roughness(&height_map(&img, &s), &s);
+        assert!(r.get_pixel(8, 8).0[0] > r.get_pixel(28, 8).0[0]);
+    }
+
+    #[test]
+    fn settings_round_trip_through_json() {
+        let s = Settings {
+            blur: 2.5,
+            ao_radius: 12.0,
+            tileable: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), s);
     }
 
     #[test]
     fn blur_preserves_dimensions_and_range() {
-        let s = Settings { blur: 4.0, ..Settings::default() };
+        let s = Settings {
+            blur: 4.0,
+            ..Settings::default()
+        };
         let hm = height_map(&solid(32, 24, 200), &s);
         assert_eq!((hm.width, hm.height), (32, 24));
         assert!(hm.data.iter().all(|v| (0.0..=1.0).contains(v)));

@@ -1,15 +1,24 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod batch;
 mod normalmap;
+mod worker;
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use image::RgbaImage;
-use normalmap::{HeightSource, Kernel, Settings};
+
+use batch::Batch;
+use normalmap::{HeightSource, Kernel, MapKind, Settings};
+use worker::{Request, Worker};
 
 const PREVIEW_MAX: u32 = 1024;
+/// How long the settings have to sit still before we kick off a regeneration.
+const DEBOUNCE: Duration = Duration::from_millis(80);
+const SETTINGS_KEY: &str = "settings";
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -24,7 +33,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
-            Ok(Box::<App>::default())
+            Ok(Box::new(App::new(cc)))
         }),
     )
 }
@@ -38,19 +47,23 @@ fn setup_style(ctx: &egui::Context) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Source,
-    Height,
-    Normal,
+    Map(MapKind),
 }
 
 /// The currently loaded image plus everything derived from it.
 struct Loaded {
     path: Option<PathBuf>,
-    source: RgbaImage,
+    source: Arc<RgbaImage>,
     /// Downscaled copy the live preview is generated from.
-    preview_source: RgbaImage,
+    preview_source: Arc<RgbaImage>,
     source_tex: egui::TextureHandle,
-    height_tex: Option<egui::TextureHandle>,
-    normal_tex: Option<egui::TextureHandle>,
+    maps: Vec<(MapKind, egui::TextureHandle)>,
+}
+
+impl Loaded {
+    fn texture(&self, kind: MapKind) -> Option<&egui::TextureHandle> {
+        self.maps.iter().find(|(k, _)| *k == kind).map(|(_, t)| t)
+    }
 }
 
 struct App {
@@ -61,22 +74,37 @@ struct App {
     fit: bool,
     /// Preview from a downscaled source while dragging sliders.
     fast_preview: bool,
-    dirty: bool,
+    /// Set when the settings change; the request goes out once it stops moving.
+    dirty_since: Option<Instant>,
+    worker: Worker,
+    generation: u64,
+    pending: bool,
     last_gen_ms: f32,
+    batch: Batch,
     status: String,
 }
 
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings = cc
+            .storage
+            .and_then(|s| s.get_string(SETTINGS_KEY))
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+
         Self {
-            settings: Settings::default(),
+            settings,
             loaded: None,
-            view: View::Normal,
+            view: View::Map(MapKind::Normal),
             zoom: 1.0,
             fit: true,
             fast_preview: true,
-            dirty: false,
+            dirty_since: None,
+            worker: Worker::spawn(cc.egui_ctx.clone()),
+            generation: 0,
+            pending: false,
             last_gen_ms: 0.0,
+            batch: Batch::default(),
             status: "Open an image, or drop one onto the window.".to_owned(),
         }
     }
@@ -86,16 +114,22 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        self.poll_worker(&ctx);
         self.handle_dropped_files(&ctx);
         self.handle_shortcuts(&ctx);
-        if self.dirty {
-            self.regenerate(&ctx);
-        }
+        self.maybe_dispatch(&ctx);
 
         self.top_bar(ui, &ctx);
         self.side_panel(ui);
         self.status_bar(ui);
         self.central_panel(ui);
+        self.batch.ui(&ctx, &self.settings);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(json) = serde_json::to_string(&self.settings) {
+            storage.set_string(SETTINGS_KEY, json);
+        }
     }
 }
 
@@ -109,11 +143,15 @@ impl App {
                     self.open_dialog(ctx);
                 }
                 ui.add_enabled_ui(self.loaded.is_some(), |ui| {
-                    if ui.button("Save normal map…").on_hover_text("Ctrl+S").clicked() {
-                        self.save_dialog(View::Normal);
+                    if ui.button("Save map…").on_hover_text("Ctrl+S").clicked() {
+                        self.save_dialog();
                     }
-                    if ui.button("Save height map…").clicked() {
-                        self.save_dialog(View::Height);
+                    if ui
+                        .button("Export all…")
+                        .on_hover_text("Write every map at full resolution into a folder")
+                        .clicked()
+                    {
+                        self.export_all();
                     }
                     if ui.button("Reload").clicked()
                         && let Some(path) = self.loaded.as_ref().and_then(|l| l.path.clone())
@@ -123,9 +161,20 @@ impl App {
                 });
 
                 ui.separator();
-                if ui.button("Reset settings").clicked() {
+                if ui.button("Batch…").clicked() {
+                    self.batch.open = true;
+                }
+
+                ui.separator();
+                if ui.button("Save preset…").clicked() {
+                    self.save_preset();
+                }
+                if ui.button("Load preset…").clicked() {
+                    self.load_preset();
+                }
+                if ui.button("Reset").clicked() {
                     self.settings = Settings::default();
-                    self.dirty = true;
+                    self.touch();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -136,6 +185,7 @@ impl App {
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
         egui::Panel::left("settings")
             .resizable(false)
             .exact_size(280.0)
@@ -159,7 +209,9 @@ impl App {
                             .clamping(egui::SliderClamping::Always),
                     );
                     ui.add(egui::Slider::new(&mut s.blur, 0.0..=16.0).text("Blur"))
-                        .on_hover_text("Gaussian pre-blur; smooths out noise before differentiating");
+                        .on_hover_text(
+                            "Gaussian pre-blur; smooths out noise before differentiating",
+                        );
                     ui.checkbox(&mut s.invert_height, "Invert height")
                         .on_hover_text("Treat dark pixels as peaks instead of valleys");
 
@@ -183,16 +235,29 @@ impl App {
                     ui.checkbox(&mut s.tileable, "Seamless / tileable")
                         .on_hover_text("Wrap sampling across the borders");
 
-                    if self.settings != before {
-                        self.dirty = true;
-                    }
+                    ui.add_space(10.0);
+                    ui.heading("Ambient occlusion");
+                    ui.add(egui::Slider::new(&mut s.ao_radius, 0.0..=64.0).text("Radius"))
+                        .on_hover_text("How far to search for occluders. 0 disables AO");
+                    ui.add(egui::Slider::new(&mut s.ao_strength, 0.0..=2.0).text("Amount"));
+
+                    ui.add_space(10.0);
+                    ui.heading("Roughness");
+                    ui.add(egui::Slider::new(&mut s.roughness_base, 0.0..=1.0).text("Base"))
+                        .on_hover_text("Roughness of perfectly flat areas");
+                    ui.add(egui::Slider::new(&mut s.roughness_detail, 0.0..=32.0).text("Detail"))
+                        .on_hover_text("How strongly fine height detail raises roughness");
+                    ui.checkbox(&mut s.roughness_invert, "Invert");
+
+                    changed = self.settings != before;
 
                     ui.add_space(10.0);
                     ui.heading("Preview");
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.selectable_value(&mut self.view, View::Source, "Source");
-                        ui.selectable_value(&mut self.view, View::Height, "Height");
-                        ui.selectable_value(&mut self.view, View::Normal, "Normal");
+                        for kind in MapKind::ALL {
+                            ui.selectable_value(&mut self.view, View::Map(kind), kind.label());
+                        }
                     });
                     ui.checkbox(&mut self.fit, "Fit to window");
                     ui.add_enabled(
@@ -209,10 +274,14 @@ impl App {
                         ))
                         .changed()
                     {
-                        self.dirty = true;
+                        changed = true;
                     }
                 });
             });
+
+        if changed {
+            self.touch();
+        }
     }
 
     fn central_panel(&mut self, ui: &mut egui::Ui) {
@@ -230,8 +299,7 @@ impl App {
 
             let tex = match self.view {
                 View::Source => Some(&loaded.source_tex),
-                View::Height => loaded.height_tex.as_ref(),
-                View::Normal => loaded.normal_tex.as_ref(),
+                View::Map(kind) => loaded.texture(kind),
             };
             let Some(tex) = tex else {
                 ui.centered_and_justified(|ui| ui.spinner());
@@ -277,6 +345,9 @@ impl App {
                     ui.separator();
                 }
                 ui.label(&self.status);
+                if self.pending {
+                    ui.spinner();
+                }
             });
         });
     }
@@ -285,6 +356,65 @@ impl App {
 // ---------------------------------------------------------------- logic
 
 impl App {
+    /// Mark the settings dirty; the debounce decides when work actually starts.
+    fn touch(&mut self) {
+        self.dirty_since = Some(Instant::now());
+    }
+
+    fn maybe_dispatch(&mut self, ctx: &egui::Context) {
+        let Some(since) = self.dirty_since else {
+            return;
+        };
+        let waited = since.elapsed();
+        if waited < DEBOUNCE {
+            ctx.request_repaint_after(DEBOUNCE - waited);
+            return;
+        }
+        self.dirty_since = None;
+
+        let Some(loaded) = &self.loaded else { return };
+        let src = if self.fast_preview {
+            loaded.preview_source.clone()
+        } else {
+            loaded.source.clone()
+        };
+
+        self.generation += 1;
+        self.pending = true;
+        self.worker.request(Request {
+            generation: self.generation,
+            src,
+            settings: self.settings,
+        });
+    }
+
+    fn poll_worker(&mut self, ctx: &egui::Context) {
+        let Some(response) = self.worker.poll() else {
+            return;
+        };
+        // A newer request is already in flight; this result is stale.
+        if response.generation != self.generation {
+            return;
+        }
+        self.pending = false;
+        self.last_gen_ms = response.millis;
+
+        if let Some(loaded) = &mut self.loaded {
+            loaded.maps = response
+                .maps
+                .iter()
+                .map(|(kind, img)| {
+                    let tex = ctx.load_texture(
+                        kind.suffix(),
+                        to_color_image(img),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    (*kind, tex)
+                })
+                .collect();
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let (open, save) = ctx.input_mut(|i| {
             (
@@ -296,7 +426,7 @@ impl App {
             self.open_dialog(ctx);
         }
         if save && self.loaded.is_some() {
-            self.save_dialog(View::Normal);
+            self.save_dialog();
         }
     }
 
@@ -309,10 +439,7 @@ impl App {
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter(
-                "Images",
-                &["png", "jpg", "jpeg", "bmp", "tga", "tif", "tiff", "webp", "gif"],
-            )
+            .add_filter("Images", &batch::IMAGE_EXTENSIONS)
             .pick_file()
         {
             self.load(ctx, &path);
@@ -331,82 +458,106 @@ impl App {
                 );
                 self.loaded = Some(Loaded {
                     path: Some(path.to_path_buf()),
-                    source,
-                    preview_source,
+                    source: Arc::new(source),
+                    preview_source: Arc::new(preview_source),
                     source_tex,
-                    height_tex: None,
-                    normal_tex: None,
+                    maps: Vec::new(),
                 });
                 self.status = format!("Loaded {}", path.display());
-                self.dirty = true;
+                // Nothing to wait for on a fresh load.
+                self.dirty_since = Some(Instant::now() - DEBOUNCE);
             }
             Err(err) => self.status = format!("Failed to load {}: {err}", path.display()),
         }
     }
 
-    /// Rebuild the height and normal previews from the current settings.
-    fn regenerate(&mut self, ctx: &egui::Context) {
-        self.dirty = false;
-        let Some(loaded) = &mut self.loaded else {
-            return;
-        };
-
-        let src = if self.fast_preview {
-            &loaded.preview_source
-        } else {
-            &loaded.source
-        };
-
-        let started = Instant::now();
-        let hm = normalmap::height_map(src, &self.settings);
-        let normal = normalmap::normal_map(&hm, &self.settings);
-        self.last_gen_ms = started.elapsed().as_secs_f32() * 1000.0;
-
-        loaded.height_tex = Some(ctx.load_texture(
-            "height",
-            to_color_image(&hm.to_rgba()),
-            egui::TextureOptions::LINEAR,
-        ));
-        loaded.normal_tex = Some(ctx.load_texture(
-            "normal",
-            to_color_image(&normal),
-            egui::TextureOptions::LINEAR,
-        ));
-    }
-
-    fn save_dialog(&mut self, what: View) {
-        let Some(loaded) = &self.loaded else { return };
-
-        let stem = loaded
-            .path
+    fn stem(&self) -> String {
+        self.loaded
             .as_ref()
+            .and_then(|l| l.path.as_ref())
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "image".to_owned());
-        let suffix = if what == View::Height { "height" } else { "normal" };
+            .unwrap_or_else(|| "image".to_owned())
+    }
+
+    /// Save the map currently on screen, always at the source resolution.
+    fn save_dialog(&mut self) {
+        let Some(loaded) = &self.loaded else { return };
+        let View::Map(kind) = self.view else {
+            self.status = "Select a generated map to save.".to_owned();
+            return;
+        };
 
         let Some(path) = rfd::FileDialog::new()
             .add_filter("PNG", &["png"])
             .add_filter("TGA", &["tga"])
             .add_filter("JPEG", &["jpg"])
-            .set_file_name(format!("{stem}_{suffix}.png"))
+            .set_file_name(format!("{}_{}.png", self.stem(), kind.suffix()))
             .save_file()
         else {
             return;
         };
 
-        // Always export at the source resolution, whatever the preview used.
         let hm = normalmap::height_map(&loaded.source, &self.settings);
-        let out = if what == View::Height {
-            hm.to_rgba()
-        } else {
-            normalmap::normal_map(&hm, &self.settings)
-        };
-
+        let out = normalmap::render(&hm, &self.settings, kind);
         self.status = match out.save(&path) {
             Ok(()) => format!("Saved {}", path.display()),
             Err(err) => format!("Failed to save {}: {err}", path.display()),
         };
+    }
+
+    /// Write every map for the loaded image into a folder in one go.
+    fn export_all(&mut self) {
+        let Some(loaded) = &self.loaded else { return };
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+
+        let stem = self.stem();
+        let maps = normalmap::generate(&loaded.source, &self.settings, &MapKind::ALL);
+        for (kind, img) in maps {
+            let dest = dir.join(format!("{stem}_{}.png", kind.suffix()));
+            if let Err(err) = img.save(&dest) {
+                self.status = format!("Failed to save {}: {err}", dest.display());
+                return;
+            }
+        }
+        self.status = format!("Exported {} maps to {}", MapKind::ALL.len(), dir.display());
+    }
+
+    fn save_preset(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Preset", &["json"])
+            .set_file_name("normalmapper-preset.json")
+            .save_file()
+        else {
+            return;
+        };
+        let json = serde_json::to_string_pretty(&self.settings).unwrap_or_default();
+        self.status = match std::fs::write(&path, json) {
+            Ok(()) => format!("Saved preset {}", path.display()),
+            Err(err) => format!("Failed to save preset: {err}"),
+        };
+    }
+
+    fn load_preset(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Preset", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        match std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|json| serde_json::from_str::<Settings>(&json).map_err(|e| e.to_string()))
+        {
+            Ok(settings) => {
+                self.settings = settings;
+                self.touch();
+                self.status = format!("Loaded preset {}", path.display());
+            }
+            Err(err) => self.status = format!("Failed to load preset: {err}"),
+        }
     }
 }
 
