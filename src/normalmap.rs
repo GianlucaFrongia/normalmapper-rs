@@ -55,16 +55,24 @@ pub enum Kernel {
     Sobel,
     Scharr,
     Prewitt,
+    /// Central difference over a single texel — no cross-row smoothing.
+    Pixel,
 }
 
 impl Kernel {
-    pub const ALL: [Kernel; 3] = [Kernel::Sobel, Kernel::Scharr, Kernel::Prewitt];
+    pub const ALL: [Kernel; 4] = [
+        Kernel::Sobel,
+        Kernel::Scharr,
+        Kernel::Prewitt,
+        Kernel::Pixel,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Kernel::Sobel => "Sobel",
             Kernel::Scharr => "Scharr",
             Kernel::Prewitt => "Prewitt",
+            Kernel::Pixel => "1 px (pixel art)",
         }
     }
 
@@ -74,6 +82,8 @@ impl Kernel {
             Kernel::Sobel => [-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0],
             Kernel::Scharr => [-3.0, 0.0, 3.0, -10.0, 0.0, 10.0, -3.0, 0.0, 3.0],
             Kernel::Prewitt => [-1.0, 0.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0],
+            // Only the centre row: a hard edge stays one pixel wide.
+            Kernel::Pixel => [0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         }
     }
 
@@ -83,6 +93,7 @@ impl Kernel {
             Kernel::Sobel => 1.0 / 4.0,
             Kernel::Scharr => 1.0 / 16.0,
             Kernel::Prewitt => 1.0 / 3.0,
+            Kernel::Pixel => 1.0 / 2.0,
         }
     }
 }
@@ -436,6 +447,103 @@ fn blur_pass(
     out
 }
 
+// ------------------------------------------------------------- lit preview
+
+/// The maps a lit preview needs, all at the same (small) resolution.
+pub struct Shading {
+    pub width: u32,
+    pub height: u32,
+    pub albedo: RgbaImage,
+    pub normal: RgbaImage,
+    pub ao: RgbaImage,
+    pub roughness: RgbaImage,
+}
+
+/// A single directional light, plus the ambient term.
+#[derive(Clone, Copy, Debug)]
+pub struct Light {
+    /// Direction towards the light, in tangent space (+Y up, +Z out of screen).
+    pub dir: [f32; 3],
+    pub ambient: f32,
+    pub specular: f32,
+    /// Light the source image, rather than a neutral grey.
+    pub use_albedo: bool,
+    /// The normal map was generated with a flipped green channel.
+    pub flip_y: bool,
+}
+
+impl Default for Light {
+    fn default() -> Self {
+        Self {
+            dir: [-0.4, 0.5, 0.75],
+            ambient: 0.25,
+            specular: 0.3,
+            use_albedo: true,
+            flip_y: false,
+        }
+    }
+}
+
+/// Blinn-Phong shade the generated maps so the bumps can actually be judged.
+pub fn shade(s: &Shading, light: &Light) -> RgbaImage {
+    let (w, h) = (s.width, s.height);
+    let l = normalize(light.dir);
+    // The viewer looks straight down -Z, so the half-vector is cheap.
+    let half = normalize([l[0], l[1], l[2] + 1.0]);
+    let gy = if light.flip_y { -1.0 } else { 1.0 };
+
+    let mut buf = vec![0u8; w as usize * h as usize * 4];
+    buf.par_chunks_mut(w as usize * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..w as usize {
+                let i = y * w as usize + x;
+                let np = s.normal.as_raw();
+                let n = normalize([
+                    np[i * 4] as f32 / 127.5 - 1.0,
+                    (np[i * 4 + 1] as f32 / 127.5 - 1.0) * gy,
+                    np[i * 4 + 2] as f32 / 127.5 - 1.0,
+                ]);
+                let ao = s.ao.as_raw()[i * 4] as f32 / 255.0;
+                let rough = s.roughness.as_raw()[i * 4] as f32 / 255.0;
+
+                let diffuse = dot(n, l).max(0.0);
+                // Rough surfaces get a wide, weak highlight; smooth ones a tight one.
+                let shininess = 2.0 + (1.0 - rough).powi(2) * 128.0;
+                let spec = dot(n, half).max(0.0).powf(shininess) * light.specular * (1.0 - rough);
+
+                let o = x * 4;
+                for c in 0..3 {
+                    let albedo = if light.use_albedo {
+                        s.albedo.as_raw()[i * 4 + c] as f32 / 255.0
+                    } else {
+                        0.8
+                    };
+                    let v = albedo * (light.ambient * ao + diffuse * ao) + spec;
+                    row[o + c] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+                row[o + 3] = 255;
+            }
+        });
+
+    RgbaImage::from_raw(w, h, buf).expect("buffer matches dimensions")
+}
+
+#[inline]
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+#[inline]
+fn normalize(v: [f32; 3]) -> [f32; 3] {
+    let len = dot(v, v).sqrt();
+    if len > f32::EPSILON {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        [0.0, 0.0, 1.0]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +641,58 @@ mod tests {
         }
         let r = roughness(&height_map(&img, &s), &s);
         assert!(r.get_pixel(8, 8).0[0] > r.get_pixel(28, 8).0[0]);
+    }
+
+    #[test]
+    fn pixel_kernel_keeps_edges_one_texel_wide() {
+        // A single bright column: only its two neighbours should tilt.
+        let mut img = solid(9, 3, 0);
+        for y in 0..3 {
+            img.put_pixel(4, y, Rgba([255, 255, 255, 255]));
+        }
+        let s = Settings {
+            kernel: Kernel::Pixel,
+            ..Settings::default()
+        };
+        let nm = normal_map(&height_map(&img, &s), &s);
+        assert_eq!(
+            nm.get_pixel(4, 1).0[0],
+            128,
+            "the lit column itself is flat"
+        );
+        assert!(nm.get_pixel(3, 1).0[0] < 120);
+        assert!(nm.get_pixel(5, 1).0[0] > 136);
+        assert_eq!(nm.get_pixel(1, 1).0[0], 128, "no bleed two texels out");
+    }
+
+    #[test]
+    fn light_facing_the_normal_is_brightest() {
+        let flat = RgbaImage::from_pixel(4, 4, Rgba([128, 128, 255, 255]));
+        let s = Shading {
+            width: 4,
+            height: 4,
+            albedo: solid(4, 4, 255),
+            normal: flat,
+            ao: solid(4, 4, 255),
+            roughness: solid(4, 4, 255),
+        };
+        let head_on = shade(
+            &s,
+            &Light {
+                dir: [0.0, 0.0, 1.0],
+                specular: 0.0,
+                ..Light::default()
+            },
+        );
+        let grazing = shade(
+            &s,
+            &Light {
+                dir: [1.0, 0.0, 0.1],
+                specular: 0.0,
+                ..Light::default()
+            },
+        );
+        assert!(head_on.get_pixel(2, 2).0[0] > grazing.get_pixel(2, 2).0[0]);
     }
 
     #[test]

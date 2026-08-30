@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod batch;
+mod light;
 mod normalmap;
 mod worker;
 
@@ -12,17 +13,41 @@ use eframe::egui;
 use image::RgbaImage;
 
 use batch::Batch;
-use normalmap::{HeightSource, Kernel, MapKind, Settings};
+use light::LightPreview;
+use normalmap::{HeightSource, Kernel, MapKind, Settings, Shading};
 use worker::{Request, Worker};
 
 const PREVIEW_MAX: u32 = 1024;
 /// How long the settings have to sit still before we kick off a regeneration.
 const DEBOUNCE: Duration = Duration::from_millis(80);
 const SETTINGS_KEY: &str = "settings";
-const ZOOM_MIN: f32 = 0.02;
-const ZOOM_MAX: f32 = 32.0;
+const PIXEL_MODE_KEY: &str = "pixel_mode";
+/// Longest side of the images the lit preview shades, in pixels.
+const LIGHT_MAX: u32 = 512;
+const ZOOM_MIN: f32 = 1.0 / 64.0;
+const ZOOM_MAX: f32 = 64.0;
 /// Multiplier for one press of the zoom buttons or keys.
 const ZOOM_STEP: f32 = 1.25;
+/// Power-of-two zoom rungs, the ladder pixel-art editors use.
+const ZOOM_LADDER: [f32; 13] = [
+    1.0 / 64.0,
+    1.0 / 32.0,
+    1.0 / 16.0,
+    1.0 / 8.0,
+    1.0 / 4.0,
+    1.0 / 2.0,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    16.0,
+    32.0,
+    64.0,
+];
+/// Scroll units per zoom rung, so one wheel notch is one step.
+const SCROLL_NOTCH: f32 = 40.0;
+/// Show the texel grid from this zoom up.
+const GRID_FROM: f32 = 8.0;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -62,6 +87,8 @@ struct Loaded {
     preview_source: Arc<RgbaImage>,
     source_tex: egui::TextureHandle,
     maps: Vec<(MapKind, egui::TextureHandle)>,
+    /// Small copies of the maps, kept for the lit preview.
+    shading: Option<Shading>,
 }
 
 impl Loaded {
@@ -80,6 +107,9 @@ struct App {
     fit: bool,
     /// Preview from a downscaled source while dragging sliders.
     fast_preview: bool,
+    /// Integer zoom rungs, nearest sampling and a texel grid.
+    pixel_mode: bool,
+    scroll_accum: f32,
     /// Set when the settings change; the request goes out once it stops moving.
     dirty_since: Option<Instant>,
     worker: Worker,
@@ -87,6 +117,9 @@ struct App {
     pending: bool,
     last_gen_ms: f32,
     batch: Batch,
+    light: LightPreview,
+    /// Bumped on every finished generation, so the lit preview can tell.
+    map_revision: u64,
     status: String,
 }
 
@@ -97,6 +130,11 @@ impl App {
             .and_then(|s| s.get_string(SETTINGS_KEY))
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
+        let pixel_mode = cc
+            .storage
+            .and_then(|s| s.get_string(PIXEL_MODE_KEY))
+            .map(|v| v == "true")
+            .unwrap_or(false);
 
         Self {
             settings,
@@ -106,12 +144,16 @@ impl App {
             pan: egui::Vec2::ZERO,
             fit: true,
             fast_preview: true,
+            pixel_mode,
+            scroll_accum: 0.0,
             dirty_since: None,
             worker: Worker::spawn(cc.egui_ctx.clone()),
             generation: 0,
             pending: false,
             last_gen_ms: 0.0,
             batch: Batch::default(),
+            light: LightPreview::default(),
+            map_revision: 0,
             status: "Open an image, or drop one onto the window.".to_owned(),
         }
     }
@@ -131,12 +173,28 @@ impl eframe::App for App {
         self.status_bar(ui);
         self.central_panel(ui);
         self.batch.ui(&ctx, &self.settings);
+
+        // Split the borrow so the window can hold the maps while it draws.
+        let Self {
+            light,
+            loaded,
+            map_revision,
+            settings,
+            ..
+        } = self;
+        light.ui(
+            &ctx,
+            loaded.as_ref().and_then(|l| l.shading.as_ref()),
+            *map_revision,
+            settings.flip_y,
+        );
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         if let Ok(json) = serde_json::to_string(&self.settings) {
             storage.set_string(SETTINGS_KEY, json);
         }
+        storage.set_string(PIXEL_MODE_KEY, self.pixel_mode.to_string());
     }
 }
 
@@ -171,6 +229,13 @@ impl App {
                 if ui.button("Batch…").clicked() {
                     self.batch.open = true;
                 }
+                if ui
+                    .button("Lit preview…")
+                    .on_hover_text("See the maps under a movable light")
+                    .clicked()
+                {
+                    self.light.open = true;
+                }
 
                 ui.separator();
                 if ui.button("Save preset…").clicked() {
@@ -196,6 +261,7 @@ impl App {
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         let mut zoom_request = None;
+        let mut snap_zoom = false;
         egui::Panel::left("settings")
             .resizable(false)
             .exact_size(280.0)
@@ -284,6 +350,16 @@ impl App {
                         zoom_request = Some(zoom);
                     }
                     if ui
+                        .checkbox(&mut self.pixel_mode, "Pixel art mode")
+                        .on_hover_text(
+                            "Power-of-two zoom rungs, nearest sampling at every zoom, \
+                             a texel grid, and fit is allowed to magnify.",
+                        )
+                        .changed()
+                    {
+                        snap_zoom = true;
+                    }
+                    if ui
                         .checkbox(&mut self.fast_preview, "Fast preview")
                         .on_hover_text(format!(
                             "Preview from a copy downscaled to {PREVIEW_MAX}px. \
@@ -296,6 +372,10 @@ impl App {
                 });
             });
 
+        if snap_zoom {
+            let zoom = self.zoom;
+            self.zoom_to(zoom);
+        }
         if let Some(zoom) = zoom_request {
             self.zoom_to(zoom);
         }
@@ -315,11 +395,11 @@ impl App {
                 self.zoom_to(1.0);
             }
             if ui.button("+").on_hover_text("+ / scroll up").clicked() {
-                self.zoom_to(self.zoom * ZOOM_STEP);
+                self.zoom_step(1);
             }
             ui.label(format!("{:>4.0}%", self.zoom * 100.0));
             if ui.button("−").on_hover_text("- / scroll down").clicked() {
-                self.zoom_to(self.zoom / ZOOM_STEP);
+                self.zoom_step(-1);
             }
         });
     }
@@ -356,16 +436,23 @@ impl App {
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
             if self.fit {
-                self.zoom = fit_zoom(viewport, native);
+                self.zoom = fit_zoom(viewport, native, self.pixel_mode);
                 self.pan = egui::Vec2::ZERO;
             }
             self.handle_view_input(ui, &response, viewport, native);
             self.clamp_pan(viewport, native);
 
             let size = native * self.zoom;
-            let rect = egui::Rect::from_center_size(viewport.center() + self.pan, size);
-            // Crisp pixels when magnifying, smooth when minifying.
-            let options = if self.zoom >= 1.0 {
+            // Land the image on whole device pixels, or every texel edge blurs.
+            let ppp = ui.ctx().pixels_per_point();
+            let snap = |v: f32| (v * ppp).round() / ppp;
+            let centre = viewport.center() + self.pan;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(snap(centre.x - size.x / 2.0), snap(centre.y - size.y / 2.0)),
+                size,
+            );
+            // Pixel art is nearest at every zoom; photos only when magnifying.
+            let options = if self.pixel_mode || self.zoom >= 1.0 {
                 egui::TextureOptions::NEAREST
             } else {
                 egui::TextureOptions::LINEAR
@@ -373,6 +460,10 @@ impl App {
             egui::Image::new((tex_id, size))
                 .texture_options(options)
                 .paint_at(ui, rect);
+
+            if self.pixel_mode && self.zoom >= GRID_FROM {
+                paint_texel_grid(ui, rect, viewport, self.zoom);
+            }
         });
     }
 
@@ -403,6 +494,7 @@ impl App {
         }
 
         if !response.hovered() {
+            self.scroll_accum = 0.0;
             return;
         }
         let (scroll, pinch, cursor) = ui.ctx().input(|i| {
@@ -412,16 +504,55 @@ impl App {
                 i.pointer.hover_pos(),
             )
         });
+        let anchor = cursor.unwrap_or(viewport.center());
+
+        if self.pixel_mode {
+            // Smoothed scroll arrives over several frames; accumulate so one
+            // notch is one rung instead of four.
+            self.scroll_accum += scroll;
+            while self.scroll_accum.abs() >= SCROLL_NOTCH {
+                let dir = self.scroll_accum.signum();
+                self.scroll_accum -= dir * SCROLL_NOTCH;
+                let target = ladder_step(self.zoom, dir as i32);
+                self.zoom_at(target, anchor, viewport, native);
+            }
+            if (pinch - 1.0).abs() > 1e-4 {
+                self.zoom_at(self.zoom * pinch, anchor, viewport, native);
+            }
+            return;
+        }
+
         let factor = pinch * (scroll * 0.0025).exp();
         if (factor - 1.0).abs() > 1e-4 {
-            let anchor = cursor.unwrap_or(viewport.center());
             self.zoom_at(self.zoom * factor, anchor, viewport, native);
         }
     }
 
+    /// Clamp, and in pixel mode snap down to the nearest rung.
+    fn resolve_zoom(&self, zoom: f32) -> f32 {
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if self.pixel_mode {
+            ladder_snap(zoom)
+        } else {
+            zoom
+        }
+    }
+
+    /// One notch in or out, following the ladder in pixel mode.
+    fn zoom_step(&mut self, dir: i32) {
+        let target = if self.pixel_mode {
+            ladder_step(self.zoom, dir)
+        } else if dir > 0 {
+            self.zoom * ZOOM_STEP
+        } else {
+            self.zoom / ZOOM_STEP
+        };
+        self.zoom_to(target);
+    }
+
     /// Zoom about the viewport centre; used by the buttons, keys and slider.
     fn zoom_to(&mut self, zoom: f32) {
-        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        let zoom = self.resolve_zoom(zoom);
         // Keeping the centred point fixed is just a rescale of the pan.
         self.pan *= zoom / self.zoom;
         self.zoom = zoom;
@@ -430,7 +561,7 @@ impl App {
 
     /// Zoom while keeping the image point under `anchor` under `anchor`.
     fn zoom_at(&mut self, zoom: f32, anchor: egui::Pos2, viewport: egui::Rect, native: egui::Vec2) {
-        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        let zoom = self.resolve_zoom(zoom);
         let old_min = viewport.center() + self.pan - native * self.zoom / 2.0;
         let point = (anchor - old_min) / self.zoom;
         let new_min = anchor - point * zoom;
@@ -518,7 +649,9 @@ impl App {
         }
         self.pending = false;
         self.last_gen_ms = response.millis;
+        self.map_revision += 1;
 
+        let fast = self.fast_preview;
         if let Some(loaded) = &mut self.loaded {
             loaded.maps = response
                 .maps
@@ -532,6 +665,13 @@ impl App {
                     (*kind, tex)
                 })
                 .collect();
+
+            let albedo = if fast {
+                &loaded.preview_source
+            } else {
+                &loaded.source
+            };
+            loaded.shading = build_shading(&response.maps, albedo);
         }
     }
 
@@ -561,10 +701,10 @@ impl App {
             )
         });
         if zoom_in {
-            self.zoom_to(self.zoom * ZOOM_STEP);
+            self.zoom_step(1);
         }
         if zoom_out {
-            self.zoom_to(self.zoom / ZOOM_STEP);
+            self.zoom_step(-1);
         }
         if actual {
             self.zoom_to(1.0);
@@ -607,6 +747,7 @@ impl App {
                     preview_source: Arc::new(preview_source),
                     source_tex,
                     maps: Vec::new(),
+                    shading: None,
                 });
                 self.status = format!("Loaded {}", path.display());
                 self.fit = true;
@@ -708,10 +849,113 @@ impl App {
     }
 }
 
-/// Scale that fits `native` inside `viewport` without ever upscaling.
-fn fit_zoom(viewport: egui::Rect, native: egui::Vec2) -> f32 {
+/// Scale that fits `native` inside `viewport`. Photos are never upscaled;
+/// pixel art is, but only to a whole rung of the ladder.
+fn fit_zoom(viewport: egui::Rect, native: egui::Vec2, pixel_mode: bool) -> f32 {
     let scale = (viewport.width() / native.x).min(viewport.height() / native.y);
-    scale.min(1.0).clamp(ZOOM_MIN, ZOOM_MAX)
+    if pixel_mode {
+        ladder_snap(scale.clamp(ZOOM_MIN, ZOOM_MAX))
+    } else {
+        scale.min(1.0).clamp(ZOOM_MIN, ZOOM_MAX)
+    }
+}
+
+/// The largest rung at or below `zoom`.
+fn ladder_snap(zoom: f32) -> f32 {
+    ZOOM_LADDER
+        .iter()
+        .rev()
+        .copied()
+        .find(|&rung| rung <= zoom * 1.0001)
+        .unwrap_or(ZOOM_MIN)
+}
+
+/// The next rung above or below `zoom`, saturating at the ends.
+fn ladder_step(zoom: f32, dir: i32) -> f32 {
+    if dir > 0 {
+        ZOOM_LADDER
+            .iter()
+            .copied()
+            .find(|&rung| rung > zoom * 1.0001)
+            .unwrap_or(ZOOM_MAX)
+    } else {
+        ZOOM_LADDER
+            .iter()
+            .rev()
+            .copied()
+            .find(|&rung| rung < zoom * 0.9999)
+            .unwrap_or(ZOOM_MIN)
+    }
+}
+
+/// One hairline per texel edge, drawn only over the visible part of the image.
+fn paint_texel_grid(ui: &egui::Ui, image: egui::Rect, viewport: egui::Rect, zoom: f32) {
+    let visible = image.intersect(viewport);
+    if !visible.is_positive() {
+        return;
+    }
+    let painter = ui.painter_at(viewport);
+    let stroke = egui::Stroke::new(1.0, ui.visuals().weak_text_color().gamma_multiply(0.35));
+
+    let first = |lo: f32, origin: f32| ((lo - origin) / zoom).floor().max(0.0);
+    let last = |hi: f32, origin: f32| ((hi - origin) / zoom).ceil();
+
+    let mut i = first(visible.min.x, image.min.x);
+    while i <= last(visible.max.x, image.min.x) {
+        let x = image.min.x + i * zoom;
+        painter.line_segment(
+            [egui::pos2(x, visible.min.y), egui::pos2(x, visible.max.y)],
+            stroke,
+        );
+        i += 1.0;
+    }
+    let mut j = first(visible.min.y, image.min.y);
+    while j <= last(visible.max.y, image.min.y) {
+        let y = image.min.y + j * zoom;
+        painter.line_segment(
+            [egui::pos2(visible.min.x, y), egui::pos2(visible.max.x, y)],
+            stroke,
+        );
+        j += 1.0;
+    }
+}
+
+/// Small copies of the maps for the lit preview, all at matching dimensions.
+fn build_shading(maps: &[(MapKind, RgbaImage)], albedo: &RgbaImage) -> Option<Shading> {
+    let find = |kind| maps.iter().find(|(k, _)| *k == kind).map(|(_, img)| img);
+    let normal = find(MapKind::Normal)?;
+    let ao = find(MapKind::Ao)?;
+    let roughness = find(MapKind::Roughness)?;
+
+    let (width, height) = fit_dims(normal.width(), normal.height(), LIGHT_MAX);
+    Some(Shading {
+        width,
+        height,
+        albedo: resize_to(albedo, width, height),
+        normal: resize_to(normal, width, height),
+        ao: resize_to(ao, width, height),
+        roughness: resize_to(roughness, width, height),
+    })
+}
+
+fn resize_to(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
+    if img.dimensions() == (w, h) {
+        img.clone()
+    } else {
+        image::imageops::resize(img, w, h, image::imageops::FilterType::Triangle)
+    }
+}
+
+/// Dimensions of `w`x`h` shrunk so its longest side is at most `max`.
+fn fit_dims(w: u32, h: u32, max: u32) -> (u32, u32) {
+    if w <= max && h <= max {
+        return (w, h);
+    }
+    let scale = max as f32 / w.max(h) as f32;
+    (
+        ((w as f32 * scale).round() as u32).max(1),
+        ((h as f32 * scale).round() as u32).max(1),
+    )
 }
 
 fn to_color_image(img: &RgbaImage) -> egui::ColorImage {
@@ -723,14 +967,38 @@ fn to_color_image(img: &RgbaImage) -> egui::ColorImage {
 
 /// Shrink `img` so its longest side is at most `max` pixels.
 fn downscale(img: &RgbaImage, max: u32) -> RgbaImage {
-    let (w, h) = img.dimensions();
-    if w <= max && h <= max {
-        return img.clone();
+    let (w, h) = fit_dims(img.width(), img.height(), max);
+    resize_to(img, w, h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ladder_snaps_down_to_a_rung() {
+        assert_eq!(ladder_snap(1.0), 1.0);
+        assert_eq!(ladder_snap(3.9), 2.0);
+        assert_eq!(ladder_snap(0.7), 0.5);
+        assert_eq!(ladder_snap(0.001), ZOOM_MIN);
+        assert_eq!(ladder_snap(1000.0), 64.0);
     }
-    let scale = max as f32 / w.max(h) as f32;
-    let (nw, nh) = (
-        ((w as f32 * scale).round() as u32).max(1),
-        ((h as f32 * scale).round() as u32).max(1),
-    );
-    image::imageops::resize(img, nw, nh, image::imageops::FilterType::Triangle)
+
+    #[test]
+    fn ladder_steps_move_exactly_one_rung() {
+        assert_eq!(ladder_step(1.0, 1), 2.0);
+        assert_eq!(ladder_step(1.0, -1), 0.5);
+        // A value between rungs steps to the next one either way.
+        assert_eq!(ladder_step(3.0, 1), 4.0);
+        assert_eq!(ladder_step(3.0, -1), 2.0);
+        // And it saturates rather than running off the end.
+        assert_eq!(ladder_step(64.0, 1), ZOOM_MAX);
+        assert_eq!(ladder_step(ZOOM_MIN, -1), ZOOM_MIN);
+    }
+
+    #[test]
+    fn fit_dims_only_shrinks() {
+        assert_eq!(fit_dims(32, 32, 512), (32, 32));
+        assert_eq!(fit_dims(2048, 1024, 512), (512, 256));
+    }
 }

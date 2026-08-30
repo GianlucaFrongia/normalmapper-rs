@@ -15,7 +15,7 @@ cargo run --release
   PNG, JPEG, BMP, TGA, TIFF, WebP, GIF.
 - **Height extraction** from luminance, average RGB, or a single R/G/B/A channel,
   with contrast, invert, and a Gaussian pre-blur to tame noise.
-- **Normal generation** with Sobel, Scharr or Prewitt kernels, a logarithmic
+- **Normal generation** with Sobel, Scharr, Prewitt or 1-texel kernels, a logarithmic
   strength slider, flip X, flip Y (OpenGL/Bevy vs. DirectX/Unity green channel),
   and seamless/tileable wrap sampling.
 - **Ambient occlusion** — horizon-based, marching eight directions over the
@@ -30,6 +30,15 @@ cargo run --release
   there are `− 100% + 1:1 Fit` buttons in the toolbar plus a zoom slider.
   Zoom is measured in source pixels on every tab, and switches to nearest-
   neighbour sampling above 100% so you can inspect individual texels.
+- **Pixel art mode** — power-of-two zoom rungs (1/64× … 64×) so texels never
+  come out uneven, nearest-neighbour at *every* zoom, the image snapped to
+  whole device pixels, a texel grid from 8× up, and a fit that is allowed to
+  magnify a small sprite. Pairs with the **1 px kernel**, a central difference
+  over a single texel that keeps a hard edge one pixel wide instead of
+  smearing it across three like Sobel does.
+- **Lit preview** — a window that Blinn-Phong shades the normal, AO and
+  roughness maps together, with a drag-to-aim light ball plus ambient,
+  specular and albedo controls. The only honest way to judge a normal map.
 - **Non-blocking generation** — all four maps are computed on a worker thread
   (rayon-parallel inside), with an 80 ms debounce so dragging a slider queues
   one job instead of sixty. Stale results are discarded by generation number.
@@ -49,4 +58,5 @@ cargo run --release
 - `src/worker.rs` — the background generation thread and its request/response
   channels.
 - `src/batch.rs` — the folder-conversion window and its worker.
+- `src/light.rs` — the lit-preview window and the light-direction ball.
 - `src/main.rs` — eframe app, panels, texture upload, file I/O.
