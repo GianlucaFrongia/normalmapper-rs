@@ -22,9 +22,14 @@ cargo run --release
   height field; radius and amount sliders.
 - **Roughness** — a base level plus fine height detail isolated with a
   high-pass, optionally inverted.
-- **Live preview** with Source / Height / Normal / AO / Roughness tabs,
-  fit-to-window or a zoom slider, and scroll-to-pan. "Fast preview" generates
-  from a copy downscaled to 1024px; exports always use the full resolution.
+- **Live preview** with Source / Height / Normal / AO / Roughness tabs.
+  "Fast preview" generates from a copy downscaled to 1024px; exports always use
+  the full resolution.
+- **Zoom and pan** — scroll or pinch to zoom at the cursor, drag to pan,
+  double-click to toggle fit/1:1. `+` / `-` step, `0` is 1:1, `F` fits, and
+  there are `− 100% + 1:1 Fit` buttons in the toolbar plus a zoom slider.
+  Zoom is measured in source pixels on every tab, and switches to nearest-
+  neighbour sampling above 100% so you can inspect individual texels.
 - **Non-blocking generation** — all four maps are computed on a worker thread
   (rayon-parallel inside), with an 80 ms debounce so dragging a slider queues
   one job instead of sixty. Stale results are discarded by generation number.

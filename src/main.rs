@@ -19,6 +19,10 @@ const PREVIEW_MAX: u32 = 1024;
 /// How long the settings have to sit still before we kick off a regeneration.
 const DEBOUNCE: Duration = Duration::from_millis(80);
 const SETTINGS_KEY: &str = "settings";
+const ZOOM_MIN: f32 = 0.02;
+const ZOOM_MAX: f32 = 32.0;
+/// Multiplier for one press of the zoom buttons or keys.
+const ZOOM_STEP: f32 = 1.25;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -71,6 +75,8 @@ struct App {
     loaded: Option<Loaded>,
     view: View,
     zoom: f32,
+    /// Image centre offset from the viewport centre, in screen pixels.
+    pan: egui::Vec2,
     fit: bool,
     /// Preview from a downscaled source while dragging sliders.
     fast_preview: bool,
@@ -97,6 +103,7 @@ impl App {
             loaded: None,
             view: View::Map(MapKind::Normal),
             zoom: 1.0,
+            pan: egui::Vec2::ZERO,
             fit: true,
             fast_preview: true,
             dirty_since: None,
@@ -179,6 +186,8 @@ impl App {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::global_theme_preference_switch(ui);
+                    ui.separator();
+                    self.zoom_controls(ui);
                 });
             });
         });
@@ -186,6 +195,7 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
+        let mut zoom_request = None;
         egui::Panel::left("settings")
             .resizable(false)
             .exact_size(280.0)
@@ -259,13 +269,20 @@ impl App {
                             ui.selectable_value(&mut self.view, View::Map(kind), kind.label());
                         }
                     });
-                    ui.checkbox(&mut self.fit, "Fit to window");
-                    ui.add_enabled(
-                        !self.fit,
-                        egui::Slider::new(&mut self.zoom, 0.05..=8.0)
-                            .logarithmic(true)
-                            .text("Zoom"),
-                    );
+                    if ui.checkbox(&mut self.fit, "Fit to window").changed() {
+                        self.pan = egui::Vec2::ZERO;
+                    }
+                    let mut zoom = self.zoom;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut zoom, ZOOM_MIN..=ZOOM_MAX)
+                                .logarithmic(true)
+                                .text("Zoom"),
+                        )
+                        .changed()
+                    {
+                        zoom_request = Some(zoom);
+                    }
                     if ui
                         .checkbox(&mut self.fast_preview, "Fast preview")
                         .on_hover_text(format!(
@@ -279,9 +296,32 @@ impl App {
                 });
             });
 
+        if let Some(zoom) = zoom_request {
+            self.zoom_to(zoom);
+        }
         if changed {
             self.touch();
         }
+    }
+
+    fn zoom_controls(&mut self, ui: &mut egui::Ui) {
+        // Laid out right-to-left, so this reads backwards on screen.
+        ui.add_enabled_ui(self.loaded.is_some(), |ui| {
+            if ui.button("Fit").on_hover_text("F").clicked() {
+                self.fit = true;
+                self.pan = egui::Vec2::ZERO;
+            }
+            if ui.button("1:1").on_hover_text("0").clicked() {
+                self.zoom_to(1.0);
+            }
+            if ui.button("+").on_hover_text("+ / scroll up").clicked() {
+                self.zoom_to(self.zoom * ZOOM_STEP);
+            }
+            ui.label(format!("{:>4.0}%", self.zoom * 100.0));
+            if ui.button("−").on_hover_text("- / scroll down").clicked() {
+                self.zoom_to(self.zoom / ZOOM_STEP);
+            }
+        });
     }
 
     fn central_panel(&mut self, ui: &mut egui::Ui) {
@@ -305,27 +345,107 @@ impl App {
                 ui.centered_and_justified(|ui| ui.spinner());
                 return;
             };
+            let tex_id = tex.id();
 
-            let native = tex.size_vec2();
-            let size = if self.fit {
-                let avail = ui.available_size();
-                let scale = (avail.x / native.x).min(avail.y / native.y).min(1.0);
-                native * scale
+            // Measure in source pixels so zoom means the same thing on every
+            // tab, even when fast preview generates from a downscaled copy.
+            let (sw, sh) = loaded.source.dimensions();
+            let native = egui::vec2(sw as f32, sh as f32);
+
+            let (viewport, response) =
+                ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+
+            if self.fit {
+                self.zoom = fit_zoom(viewport, native);
+                self.pan = egui::Vec2::ZERO;
+            }
+            self.handle_view_input(ui, &response, viewport, native);
+            self.clamp_pan(viewport, native);
+
+            let size = native * self.zoom;
+            let rect = egui::Rect::from_center_size(viewport.center() + self.pan, size);
+            // Crisp pixels when magnifying, smooth when minifying.
+            let options = if self.zoom >= 1.0 {
+                egui::TextureOptions::NEAREST
             } else {
-                native * self.zoom
+                egui::TextureOptions::LINEAR
             };
-
-            egui::ScrollArea::both()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.add(
-                            egui::Image::new((tex.id(), size))
-                                .texture_options(egui::TextureOptions::NEAREST),
-                        );
-                    });
-                });
+            egui::Image::new((tex_id, size))
+                .texture_options(options)
+                .paint_at(ui, rect);
         });
+    }
+
+    /// Scroll/pinch to zoom at the cursor, drag to pan, double-click to toggle.
+    fn handle_view_input(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        viewport: egui::Rect,
+        native: egui::Vec2,
+    ) {
+        if response.dragged() {
+            self.pan += response.drag_delta();
+            self.fit = false;
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+
+        if response.double_clicked() {
+            if self.fit {
+                let anchor = response.interact_pointer_pos().unwrap_or(viewport.center());
+                self.zoom_at(1.0, anchor, viewport, native);
+            } else {
+                self.fit = true;
+                self.pan = egui::Vec2::ZERO;
+            }
+        }
+
+        if !response.hovered() {
+            return;
+        }
+        let (scroll, pinch, cursor) = ui.ctx().input(|i| {
+            (
+                i.smooth_scroll_delta.y,
+                i.zoom_delta(),
+                i.pointer.hover_pos(),
+            )
+        });
+        let factor = pinch * (scroll * 0.0025).exp();
+        if (factor - 1.0).abs() > 1e-4 {
+            let anchor = cursor.unwrap_or(viewport.center());
+            self.zoom_at(self.zoom * factor, anchor, viewport, native);
+        }
+    }
+
+    /// Zoom about the viewport centre; used by the buttons, keys and slider.
+    fn zoom_to(&mut self, zoom: f32) {
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        // Keeping the centred point fixed is just a rescale of the pan.
+        self.pan *= zoom / self.zoom;
+        self.zoom = zoom;
+        self.fit = false;
+    }
+
+    /// Zoom while keeping the image point under `anchor` under `anchor`.
+    fn zoom_at(&mut self, zoom: f32, anchor: egui::Pos2, viewport: egui::Rect, native: egui::Vec2) {
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        let old_min = viewport.center() + self.pan - native * self.zoom / 2.0;
+        let point = (anchor - old_min) / self.zoom;
+        let new_min = anchor - point * zoom;
+        self.pan = new_min + native * zoom / 2.0 - viewport.center();
+        self.zoom = zoom;
+        self.fit = false;
+    }
+
+    /// Stop the image being dragged completely off screen.
+    fn clamp_pan(&mut self, viewport: egui::Rect, native: egui::Vec2) {
+        const KEEP_VISIBLE: f32 = 48.0;
+        let size = native * self.zoom;
+        let limit = (size + viewport.size()) / 2.0 - egui::Vec2::splat(KEEP_VISIBLE);
+        self.pan.x = self.pan.x.clamp(-limit.x.max(0.0), limit.x.max(0.0));
+        self.pan.y = self.pan.y.clamp(-limit.y.max(0.0), limit.y.max(0.0));
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -428,6 +548,31 @@ impl App {
         if save && self.loaded.is_some() {
             self.save_dialog();
         }
+        self.handle_zoom_keys(ctx);
+    }
+
+    fn handle_zoom_keys(&mut self, ctx: &egui::Context) {
+        let (zoom_in, zoom_out, actual, fit) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                i.key_pressed(egui::Key::Minus),
+                i.key_pressed(egui::Key::Num0),
+                i.key_pressed(egui::Key::F),
+            )
+        });
+        if zoom_in {
+            self.zoom_to(self.zoom * ZOOM_STEP);
+        }
+        if zoom_out {
+            self.zoom_to(self.zoom / ZOOM_STEP);
+        }
+        if actual {
+            self.zoom_to(1.0);
+        }
+        if fit {
+            self.fit = true;
+            self.pan = egui::Vec2::ZERO;
+        }
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -464,6 +609,8 @@ impl App {
                     maps: Vec::new(),
                 });
                 self.status = format!("Loaded {}", path.display());
+                self.fit = true;
+                self.pan = egui::Vec2::ZERO;
                 // Nothing to wait for on a fresh load.
                 self.dirty_since = Some(Instant::now() - DEBOUNCE);
             }
@@ -559,6 +706,12 @@ impl App {
             Err(err) => self.status = format!("Failed to load preset: {err}"),
         }
     }
+}
+
+/// Scale that fits `native` inside `viewport` without ever upscaling.
+fn fit_zoom(viewport: egui::Rect, native: egui::Vec2) -> f32 {
+    let scale = (viewport.width() / native.x).min(viewport.height() / native.y);
+    scale.min(1.0).clamp(ZOOM_MIN, ZOOM_MAX)
 }
 
 fn to_color_image(img: &RgbaImage) -> egui::ColorImage {
