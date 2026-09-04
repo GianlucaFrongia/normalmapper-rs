@@ -28,27 +28,55 @@ cargo run --release
 - **Zoom and pan** — scroll or pinch to zoom at the cursor, drag to pan,
   double-click to toggle fit/1:1. `+` / `-` step, `0` is 1:1, `F` fits, and
   there are `− 100% + 1:1 Fit` buttons in the toolbar plus a zoom slider.
-  Zoom is measured in source pixels on every tab, and switches to nearest-
-  neighbour sampling above 100% so you can inspect individual texels.
+  Zoom is measured in source pixels on every tab; turn on pixel art mode for
+  nearest-neighbour sampling, so you can inspect individual texels.
 - **Pixel art mode** — power-of-two zoom rungs (1/64× … 64×) so texels never
   come out uneven, nearest-neighbour at *every* zoom, the image snapped to
   whole device pixels, a texel grid from 8× up, and a fit that is allowed to
   magnify a small sprite. Pairs with the **1 px kernel**, a central difference
   over a single texel that keeps a hard edge one pixel wide instead of
   smearing it across three like Sobel does.
-- **Lit preview** — a window that Blinn-Phong shades the normal, AO and
-  roughness maps together, with a drag-to-aim light ball plus ambient,
-  specular and albedo controls. The only honest way to judge a normal map.
+- **Relief** — four height canvases, painted texel by texel: how high every
+  texel's **top**, **left**, **right** and **bottom** edge stands. Right minus
+  left is the horizontal slope and bottom minus top the vertical one, so the
+  normal falls straight out of the four numbers — no kernel, no neighbours,
+  nothing inferred from the picture. That is why it bakes on every stroke, and
+  why the lit column answers the brush while you are still holding it. Pencil,
+  eraser, fill, eyedropper, raise, lower and smooth; a 1–8 texel brush;
+  per-stroke undo (`Ctrl/Cmd+Z`); its own Depth, so the image's Strength slider
+  cannot move it. Heights come in ten-per-cent rungs, picked from a row of
+  swatches showing the grey each one bakes to — a relief in eleven greys can be
+  read straight off the canvas, and Raise and Lower count in rungs so a texel
+  nudged from a swatch lands on a swatch. Unpainted texels stay transparent on
+  the canvas and bake as flat — "nothing here" and "flat, deliberately" are
+  different claims, and the loaded image shows through behind them unfiltered,
+  as it is, whatever the zoom (**Reference** fades it, **Canvas** fades the
+  heights back off it). Drag to paint, right-drag to pan. Paint with no image
+  open at all, or let a newly opened image size the canvas for you (capped at
+  512 a side).
+- **Lit preview** — a column down the right of the window that Blinn-Phong
+  shades the normal, AO and roughness maps together, with a drag-to-aim light
+  ball plus ambient, specular and albedo controls. The only honest way to judge
+  a normal map, and it sits beside the knobs that made it rather than floating
+  over them: turn a slider on the left and watch the light answer on the right.
+  Drag its edge to resize it, or fold it away with **Lit** in the toolbar.
+  It shades the painted relief as soon as there is one, and the image's own
+  maps until then; a line under the header says which.
 - **Non-blocking generation** — all four maps are computed on a worker thread
   (rayon-parallel inside), with an 80 ms debounce so dragging a slider queues
   one job instead of sixty. Stale results are discarded by generation number.
-- **Export** the visible map (`Ctrl/Cmd+S`) as PNG/TGA/JPEG, or "Export all…"
+- **Export** the visible map or relief canvas (`Ctrl/Cmd+S`) as PNG/TGA/JPEG, or "Export all…"
   to write `name_normal.png`, `name_height.png`, `name_ao.png` and
   `name_roughness.png` into a folder.
 - **Batch convert** a whole folder: pick input and output directories and which
   maps to write, then it runs across all images in parallel with a progress bar.
 - **Presets** — save/load the settings as JSON, and the last-used settings are
   restored on the next launch.
+- **The look** is the app's own, not egui's default: a `Visuals` set in
+  `theme.rs` — three surface levels, an indigo accent, filled slider rails,
+  small-caps section rules instead of headings, pill tabs, every readout in the
+  monospace face, and the image lifted off a sunken well on a soft shadow.
+  Light and dark differ only in their numbers.
 - Light/dark theme switch; generation time shown in the status bar.
 
 ## Layout
@@ -58,5 +86,11 @@ cargo run --release
 - `src/worker.rs` — the background generation thread and its request/response
   channels.
 - `src/batch.rs` — the folder-conversion window and its worker.
-- `src/light.rs` — the lit-preview window and the light-direction ball.
+- `src/light.rs` — the lit-preview column and the light-direction ball.
+- `src/relief.rs` — the four hand-painted edge-height canvases, the brush and
+  its undo history, and the bake that turns four numbers per texel into a
+  normal map (unit-tested: `cargo test`).
+- `src/theme.rs` — the look: the palettes, the style they are installed as, and
+  the few widgets egui has no stock version of (a section rule, a pill tab, the
+  well the image sits in, and the relief tools' icons).
 - `src/main.rs` — eframe app, panels, texture upload, file I/O.

@@ -1,4 +1,9 @@
-//! The lit-preview window: a draggable light over the generated maps.
+//! The lit preview: a draggable light over the generated maps.
+//!
+//! It sits in a column beside the maps rather than in a window of its own.
+//! Judging a normal map means watching it move under a light while you turn
+//! the knobs that made it — a floating window puts the two in different
+//! places, and covers the thing being judged as soon as the mouse lands on it.
 
 use eframe::egui;
 
@@ -8,6 +13,8 @@ use crate::normalmap::{self, Light, Shading};
 const BALL_RADIUS: f32 = 44.0;
 
 pub struct LightPreview {
+    /// Whether the column is showing. Not a window any more — a panel the
+    /// window can be narrowed by folding away.
     pub open: bool,
     light: Light,
     tex: Option<egui::TextureHandle>,
@@ -19,7 +26,7 @@ pub struct LightPreview {
 impl Default for LightPreview {
     fn default() -> Self {
         Self {
-            open: false,
+            open: true,
             light: Light::default(),
             tex: None,
             seen_revision: u64::MAX,
@@ -29,10 +36,14 @@ impl Default for LightPreview {
 }
 
 impl LightPreview {
-    pub fn ui(
+    /// The right-hand column. Drawn before the central panel, so the maps get
+    /// whatever width is left rather than the other way round.
+    pub fn panel(
         &mut self,
+        ui: &mut egui::Ui,
         ctx: &egui::Context,
         shading: Option<&Shading>,
+        source: &str,
         revision: u64,
         flip_y: bool,
     ) {
@@ -48,19 +59,35 @@ impl LightPreview {
             self.dirty = true;
         }
 
-        let mut open = self.open;
-        egui::Window::new("Lit preview")
-            .open(&mut open)
-            .default_size([340.0, 420.0])
-            .show(ctx, |ui| self.contents(ui, ctx, shading));
-        self.open = open;
+        egui::Panel::right("lit")
+            .resizable(true)
+            .default_size(380.0)
+            .size_range(280.0..=720.0)
+            .show(ui, |ui| self.contents(ui, ctx, shading, source));
     }
 
-    fn contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, shading: Option<&Shading>) {
+    fn contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        shading: Option<&Shading>,
+        source: &str,
+    ) {
+        crate::theme::section(ui, "Lit preview");
         let Some(shading) = shading else {
-            ui.label("Open an image to see it lit.");
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("Open an image, or paint a relief, to see it lit.").weak(),
+                );
+            });
             return;
         };
+        // Two things can feed this column; say which one is talking.
+        ui.label(
+            egui::RichText::new(format!("from the {source}"))
+                .small()
+                .color(crate::theme::palette(ui).text_weak),
+        );
 
         if self.dirty || self.tex.is_none() {
             self.dirty = false;
@@ -75,19 +102,36 @@ impl LightPreview {
             ));
         }
 
-        if let Some(tex) = &self.tex {
-            let native = tex.size_vec2();
-            let avail = ui.available_size() - egui::vec2(0.0, 150.0);
-            let scale = (avail.x / native.x).min(avail.y / native.y).max(0.05);
-            ui.vertical_centered(|ui| {
-                ui.add(
-                    egui::Image::new((tex.id(), native * scale))
-                        .texture_options(egui::TextureOptions::NEAREST),
-                );
-            });
-        }
+        // The controls go at the bottom so the image gets whatever is left,
+        // rather than the other way round.
+        egui::Panel::bottom("light-controls")
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| self.controls(ui));
 
-        ui.separator();
+        let Some(tex) = &self.tex else { return };
+        let native = tex.size_vec2();
+        let (viewport, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+        let avail = viewport.size() - egui::vec2(8.0, 8.0);
+        let mut scale = (avail.x / native.x).min(avail.y / native.y).max(0.05);
+        // Magnify by whole texels only: this is a pixel-art preview, and a
+        // sprite blown up 7.3× has uneven texels wherever the fraction lands.
+        if scale > 1.0 {
+            scale = scale.floor();
+        }
+        let rect = egui::Rect::from_center_size(viewport.center(), (native * scale).round());
+
+        crate::theme::well(ui, viewport);
+        // Without this a transparent sprite reads as a dark silhouette.
+        crate::theme::paint_checkerboard(ui, rect);
+        crate::theme::sprite_frame(ui, rect);
+        egui::Image::new((tex.id(), rect.size()))
+            .texture_options(egui::TextureOptions::NEAREST)
+            .paint_at(ui, rect);
+    }
+
+    /// The light itself: where it comes from, and what the surface does with it.
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             self.light_ball(ui);
             ui.vertical(|ui| {
@@ -128,15 +172,22 @@ impl LightPreview {
             self.dirty = true;
         }
 
+        let p = crate::theme::palette(ui);
         let painter = ui.painter();
-        let visuals = ui.visuals();
-        painter.circle_filled(centre, BALL_RADIUS, visuals.extreme_bg_color);
-        painter.circle_stroke(centre, BALL_RADIUS, visuals.widgets.inactive.fg_stroke);
+        painter.circle_filled(centre, BALL_RADIUS, p.well);
+        painter.circle_stroke(centre, BALL_RADIUS, egui::Stroke::new(1.0, p.line));
+        // A horizon ring, so the ball reads as a hemisphere rather than a
+        // disc: inside it the light is high, out at the rim it is grazing.
+        painter.circle_stroke(
+            centre,
+            BALL_RADIUS * 0.55,
+            egui::Stroke::new(1.0, p.line.gamma_multiply(0.7)),
+        );
 
         let [x, y, _] = self.light.dir;
         let knob = centre + egui::vec2(x, -y) * BALL_RADIUS;
-        painter.line_segment([centre, knob], visuals.widgets.inactive.fg_stroke);
-        painter.circle_filled(knob, 5.0, visuals.strong_text_color());
+        painter.line_segment([centre, knob], egui::Stroke::new(1.0, p.accent_soft));
+        painter.circle_filled(knob, 5.0, p.text_strong);
         response.on_hover_text("Drag to move the light");
     }
 }
