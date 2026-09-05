@@ -1,7 +1,7 @@
 # Normal Mapper
 
 A small desktop app (Rust + egui/eframe) that turns an image into a full 2D
-texture set: tangent-space normal, height, ambient occlusion and roughness.
+texture set: tangent-space normal, height and roughness.
 
 ## Run
 
@@ -22,11 +22,9 @@ cargo run --release
   logarithmic strength slider, flip X, flip Y, and seamless/tileable wrap
   sampling. Off, **Flip Y** is the OpenGL convention (+Y up — Unity, Godot,
   Bevy, Blender); on, it is DirectX (+Y down — Unreal).
-- **Ambient occlusion** — horizon-based, marching eight directions over the
-  height field; radius and amount sliders.
 - **Roughness** — a base level plus fine height detail isolated with a
   high-pass, optionally inverted.
-- **Live preview** with Source / Height / Normal / AO / Roughness tabs.
+- **Live preview** with Source / Height / Normal / Roughness tabs.
   "Fast preview" generates from a copy downscaled to 1024px; exports always use
   the full resolution.
 - **Zoom and pan** — scroll or pinch to zoom at the cursor, drag to pan,
@@ -59,7 +57,7 @@ cargo run --release
   open at all, or let a newly opened image size the canvas for you (capped at
   512 a side).
 - **Lit preview** — a column down the right of the window that Blinn-Phong
-  shades the normal, AO and roughness maps together, with a drag-to-aim light
+  shades the normal and roughness maps together, with a drag-to-aim light
   ball plus ambient, specular and albedo controls. The only honest way to judge
   a normal map, and it sits beside the knobs that made it rather than floating
   over them: turn a slider on the left and watch the light answer on the right.
@@ -70,8 +68,8 @@ cargo run --release
   (rayon-parallel inside), with an 80 ms debounce so dragging a slider queues
   one job instead of sixty. Stale results are discarded by generation number.
 - **Export** the visible map or relief canvas (`Ctrl/Cmd+S`) as PNG/TGA/JPEG, or "Export all…"
-  to write `name_normal.png`, `name_height.png`, `name_ao.png` and
-  `name_roughness.png` into a folder.
+  to write `name_normal.png`, `name_height.png` and `name_roughness.png`
+  into a folder.
 - **Batch convert** a whole folder: pick input and output directories and which
   maps to write, then it runs across all images in parallel with a progress bar.
 - **Presets** — save/load the settings as JSON, and the last-used settings are
@@ -103,12 +101,11 @@ survive.
   Texture* named `_NormalMap`, on a `Sprite-Lit-Default` material with a
   `Light2D` in the scene. Godot 4 wants a `CanvasTexture` with `texture_normal`
   (and `texture_specular`) under a `PointLight2D`.
-- **AO and roughness are 3D-shaped.** 2D lit pipelines mostly have nowhere to
-  put them: Godot's `CanvasTexture` takes a specular map rather than a
-  roughness one, and Unity 2D has no AO slot at all. The usual answer is to
-  multiply AO into the albedo at bake time and use roughness to author the
-  specular map. They are exported because the lit preview shades with them,
-  and because 3D material workflows do take all four.
+- **Roughness is 3D-shaped.** 2D lit pipelines mostly have nowhere to put it:
+  Godot's `CanvasTexture` takes a specular map rather than a roughness one, and
+  Unity 2D has no slot for it at all. The usual answer is to author the
+  specular map from it. It is exported because the lit preview shades with it,
+  and because 3D material workflows do take it as it is.
 - **Hand-paint, don't infer.** For sprites the luminance path is a first draft
   at best — colour is paint, not depth, and a dark outline is not a trench.
   That is what the relief is for, and it is how lit pixel art is actually
@@ -118,17 +115,17 @@ survive.
 answers a texel's *slope*, never its elevation: a region painted all one height
 is a plateau, and a plateau is flat whether it stands at 10% or 100%. What
 lights is the difference between a texel's edges — the reason the four canvases
-are edges rather than one height per texel, and why AO is the only map here
-that elevation alone moves.
+are edges rather than one height per texel, and why raising a whole region
+changes nothing the light can see.
 
 The **lit preview** shades the way an engine does rather than the way that is
-cheapest: lighting in linear space and encoding on the way out, ambient
-occlusion applied to the ambient term only, and specular gated on N·L so a face
-turned away from the light cannot catch a highlight.
+cheapest: lighting in linear space, encoding on the way out, and gating
+specular on N·L so a face turned away from the light cannot catch a
+highlight.
 
 ## Layout
 
-- `src/normalmap.rs` — height extraction, blur, and the normal/AO/roughness math
+- `src/normalmap.rs` — height extraction, blur, and the normal/roughness math
   (no UI dependencies, covered by unit tests: `cargo test`).
 - `src/worker.rs` — the background generation thread and its request/response
   channels.

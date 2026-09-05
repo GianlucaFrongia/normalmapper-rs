@@ -531,7 +531,7 @@ impl Relief {
     /// Rebake if anything moved, and keep the textures in step. Cheap enough
     /// to call every frame: it does nothing unless something changed.
     pub fn sync(&mut self, ctx: &egui::Context, settings: &Settings, albedo: Option<&RgbaImage>) {
-        // The bake borrows flip X/Y, tileable and the AO and roughness knobs
+        // The bake borrows flip X/Y, tileable and the roughness knobs
         // from the image pipeline, so it is stale when those move too.
         if self.last_settings != Some(*settings) {
             self.last_settings = Some(*settings);
@@ -651,11 +651,10 @@ impl Relief {
             height: h,
             data,
         };
-        // AO reads depth from `strength`, and the relief keeps its own.
+        // Roughness reads depth from `strength`, and the relief keeps its own.
         let mut s = *settings;
         s.strength = depth;
         let height = hm.to_rgba();
-        let ao = normalmap::render(&hm, &s, MapKind::Ao);
         let roughness = normalmap::render(&hm, &s, MapKind::Roughness);
 
         let albedo = match albedo {
@@ -672,7 +671,6 @@ impl Relief {
                 height: h,
                 albedo,
                 normal: normal.clone(),
-                ao,
                 roughness,
             },
             normal,

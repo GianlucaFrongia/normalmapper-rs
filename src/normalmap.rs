@@ -120,11 +120,6 @@ pub struct Settings {
     /// instead of whatever colour happens to sit under the eraser.
     pub ignore_transparent: bool,
 
-    /// Horizon search radius in pixels for ambient occlusion; 0 disables it.
-    pub ao_radius: f32,
-    /// How much of the computed occlusion to keep.
-    pub ao_strength: f32,
-
     /// Roughness value for perfectly smooth areas.
     pub roughness_base: f32,
     /// How strongly fine height detail pushes roughness up.
@@ -145,8 +140,6 @@ impl Default for Settings {
             flip_y: false,
             tileable: false,
             ignore_transparent: true,
-            ao_radius: 8.0,
-            ao_strength: 1.0,
             roughness_base: 0.4,
             roughness_detail: 8.0,
             roughness_invert: false,
@@ -159,23 +152,16 @@ impl Default for Settings {
 pub enum MapKind {
     Height,
     Normal,
-    Ao,
     Roughness,
 }
 
 impl MapKind {
-    pub const ALL: [MapKind; 4] = [
-        MapKind::Height,
-        MapKind::Normal,
-        MapKind::Ao,
-        MapKind::Roughness,
-    ];
+    pub const ALL: [MapKind; 3] = [MapKind::Height, MapKind::Normal, MapKind::Roughness];
 
     pub fn label(self) -> &'static str {
         match self {
             MapKind::Height => "Height",
             MapKind::Normal => "Normal",
-            MapKind::Ao => "AO",
             MapKind::Roughness => "Roughness",
         }
     }
@@ -185,7 +171,6 @@ impl MapKind {
         match self {
             MapKind::Height => "height",
             MapKind::Normal => "normal",
-            MapKind::Ao => "ao",
             MapKind::Roughness => "roughness",
         }
     }
@@ -196,7 +181,6 @@ pub fn render(hm: &HeightMap, settings: &Settings, kind: MapKind) -> RgbaImage {
     match kind {
         MapKind::Height => hm.to_rgba(),
         MapKind::Normal => normal_map(hm, settings),
-        MapKind::Ao => ambient_occlusion(hm, settings),
         MapKind::Roughness => roughness(hm, settings),
     }
 }
@@ -368,61 +352,6 @@ pub fn normal_map(hm: &HeightMap, settings: &Settings) -> RgbaImage {
     RgbaImage::from_raw(w, h, buf).expect("buffer matches dimensions")
 }
 
-/// Horizon-based ambient occlusion over the height field.
-///
-/// For each pixel we march outwards in eight directions, track the steepest
-/// slope seen (the horizon angle), and treat its sine as the fraction of that
-/// direction's sky that is blocked.
-pub fn ambient_occlusion(hm: &HeightMap, settings: &Settings) -> RgbaImage {
-    const DIRS: usize = 8;
-    let (w, h) = (hm.width, hm.height);
-    let radius = settings.ao_radius;
-    if radius <= 0.0 || settings.ao_strength <= 0.0 {
-        return RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]));
-    }
-
-    let steps = (radius.ceil() as i32).clamp(1, 48);
-    let step_len = radius / steps as f32;
-    let depth = settings.strength.max(0.001);
-    let dirs: Vec<(f32, f32)> = (0..DIRS)
-        .map(|d| {
-            let a = d as f32 * std::f32::consts::TAU / DIRS as f32;
-            (a.cos(), a.sin())
-        })
-        .collect();
-
-    let mut buf = vec![0u8; w as usize * h as usize * 4];
-    buf.par_chunks_mut(w as usize * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
-            for x in 0..w as usize {
-                let h0 = hm.get(x as i32, y as i32, settings.tileable);
-                let mut occ = 0.0;
-                for &(cs, sn) in &dirs {
-                    let mut horizon = 0.0f32;
-                    for s in 1..=steps {
-                        let dist = s as f32 * step_len;
-                        let sx = (x as f32 + cs * dist).round() as i32;
-                        let sy = (y as f32 + sn * dist).round() as i32;
-                        let dh = (hm.get(sx, sy, settings.tileable) - h0) * depth;
-                        horizon = horizon.max(dh / dist);
-                    }
-                    // sin(atan(slope)) — the blocked share of that direction.
-                    occ += horizon / (horizon * horizon + 1.0).sqrt();
-                }
-                let ao = (1.0 - (occ / DIRS as f32) * settings.ao_strength).clamp(0.0, 1.0);
-                let c = (ao * 255.0).round() as u8;
-                let o = x * 4;
-                row[o] = c;
-                row[o + 1] = c;
-                row[o + 2] = c;
-                row[o + 3] = 255;
-            }
-        });
-
-    RgbaImage::from_raw(w, h, buf).expect("buffer matches dimensions")
-}
-
 /// Radius of the low-pass used to isolate fine detail for the roughness map.
 const ROUGHNESS_HIGHPASS: f32 = 3.0;
 
@@ -510,7 +439,6 @@ pub struct Shading {
     pub height: u32,
     pub albedo: RgbaImage,
     pub normal: RgbaImage,
-    pub ao: RgbaImage,
     pub roughness: RgbaImage,
 }
 
@@ -559,7 +487,6 @@ pub fn shade(s: &Shading, light: &Light) -> RgbaImage {
                     (np[i * 4 + 1] as f32 / 127.5 - 1.0) * gy,
                     np[i * 4 + 2] as f32 / 127.5 - 1.0,
                 ]);
-                let ao = s.ao.as_raw()[i * 4] as f32 / 255.0;
                 let rough = s.roughness.as_raw()[i * 4] as f32 / 255.0;
 
                 let diffuse = dot(n, l).max(0.0);
@@ -580,10 +507,7 @@ pub fn shade(s: &Shading, light: &Light) -> RgbaImage {
                     } else {
                         srgb_to_linear(0.8)
                     };
-                    // Ambient occlusion occludes the ambient term. Direct light
-                    // arrives along a known direction and is not what the
-                    // horizon search measured.
-                    let v = albedo * (light.ambient * ao + diffuse) + spec;
+                    let v = albedo * (light.ambient + diffuse) + spec;
                     row[o + c] = (linear_to_srgb(v.max(0.0)).clamp(0.0, 1.0) * 255.0).round() as u8;
                 }
                 // Keep the sprite's cut-out: a transparent texel is not a black
@@ -712,7 +636,6 @@ mod tests {
             height: n,
             albedo: white.clone(),
             normal: normal_map(&height_map(&bump(n), &s), &s),
-            ao: white,
             roughness: solid(n, n, 128),
         };
         let lit = shade(
@@ -740,7 +663,6 @@ mod tests {
             height: 4,
             albedo: solid(4, 4, 255),
             normal: away,
-            ao: solid(4, 4, 255),
             roughness: solid(4, 4, 0),
         };
         let lit = shade(
@@ -802,35 +724,6 @@ mod tests {
     }
 
     #[test]
-    fn flat_surface_is_unoccluded() {
-        let s = Settings::default();
-        let hm = height_map(&solid(24, 24, 90), &s);
-        for px in ambient_occlusion(&hm, &s).pixels() {
-            assert_eq!(px.0, [255, 255, 255, 255]);
-        }
-    }
-
-    #[test]
-    fn a_pit_is_darker_than_its_rim() {
-        // A single deep hole in the middle of a flat plate.
-        let mut img = solid(32, 32, 255);
-        for y in 14..18 {
-            for x in 14..18 {
-                img.put_pixel(x, y, Rgba([0, 0, 0, 255]));
-            }
-        }
-        let s = Settings {
-            ao_radius: 10.0,
-            ..Settings::default()
-        };
-        let ao = ambient_occlusion(&height_map(&img, &s), &s);
-        assert!(
-            ao.get_pixel(16, 16).0[0] < ao.get_pixel(1, 1).0[0],
-            "the pit floor should be occluded"
-        );
-    }
-
-    #[test]
     fn roughness_tracks_detail() {
         let s = Settings::default();
         // Checkerboard noise on the left half, flat on the right.
@@ -875,7 +768,6 @@ mod tests {
             height: 4,
             albedo: solid(4, 4, 255),
             normal: flat,
-            ao: solid(4, 4, 255),
             roughness: solid(4, 4, 255),
         };
         let head_on = shade(
@@ -901,7 +793,6 @@ mod tests {
     fn settings_round_trip_through_json() {
         let s = Settings {
             blur: 2.5,
-            ao_radius: 12.0,
             tileable: true,
             ..Settings::default()
         };

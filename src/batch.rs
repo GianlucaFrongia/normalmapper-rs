@@ -25,7 +25,7 @@ pub struct Batch {
     pub open: bool,
     input: Option<PathBuf>,
     output: Option<PathBuf>,
-    selected: [bool; 4],
+    selected: [bool; 3],
     run: Option<Run>,
     report: Option<String>,
 }
@@ -37,7 +37,7 @@ impl Default for Batch {
             input: None,
             output: None,
             // Normal only, matching what most people came for.
-            selected: [false, true, false, false],
+            selected: [false, true, false],
             run: None,
             report: None,
         }

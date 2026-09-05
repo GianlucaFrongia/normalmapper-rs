@@ -382,12 +382,6 @@ impl App {
                         .on_hover_text("Wrap sampling across the borders");
 
                     ui.add_space(10.0);
-                    theme::section(ui, "Ambient occlusion");
-                    ui.add(egui::Slider::new(&mut s.ao_radius, 0.0..=64.0).text("Radius"))
-                        .on_hover_text("How far to search for occluders. 0 disables AO");
-                    ui.add(egui::Slider::new(&mut s.ao_strength, 0.0..=2.0).text("Amount"));
-
-                    ui.add_space(10.0);
                     theme::section(ui, "Roughness");
                     ui.add(egui::Slider::new(&mut s.roughness_base, 0.0..=1.0).text("Base"))
                         .on_hover_text("Roughness of perfectly flat areas");
@@ -1458,7 +1452,6 @@ fn paint_texel_grid(ui: &egui::Ui, image: egui::Rect, viewport: egui::Rect, zoom
 fn build_shading(maps: &[(MapKind, RgbaImage)], albedo: &RgbaImage) -> Option<Shading> {
     let find = |kind| maps.iter().find(|(k, _)| *k == kind).map(|(_, img)| img);
     let normal = find(MapKind::Normal)?;
-    let ao = find(MapKind::Ao)?;
     let roughness = find(MapKind::Roughness)?;
 
     let (width, height) = fit_dims(normal.width(), normal.height(), LIGHT_MAX);
@@ -1467,7 +1460,6 @@ fn build_shading(maps: &[(MapKind, RgbaImage)], albedo: &RgbaImage) -> Option<Sh
         height,
         albedo: resize_to(albedo, width, height),
         normal: resize_to(normal, width, height),
-        ao: resize_to(ao, width, height),
         roughness: resize_to(roughness, width, height),
     })
 }
