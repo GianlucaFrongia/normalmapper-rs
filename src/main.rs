@@ -4,7 +4,6 @@ mod batch;
 mod light;
 mod normalmap;
 mod relief;
-mod shape;
 mod theme;
 mod worker;
 
@@ -19,7 +18,6 @@ use batch::Batch;
 use light::LightPreview;
 use normalmap::{HeightSource, Kernel, MapKind, Settings, Shading};
 use relief::{Relief, Side, Tool};
-use shape::Shape;
 use worker::{Request, Worker};
 
 const PREVIEW_MAX: u32 = 1024;
@@ -597,8 +595,6 @@ impl App {
             .on_hover_text("Fade the heights back to check them against the art underneath.");
         });
 
-        self.shape_controls(ui);
-
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(self.relief.can_undo(), egui::Button::new("Undo"))
@@ -658,124 +654,6 @@ impl App {
 
     /// Show one side's canvas, framed: the canvas is rarely the size of the
     /// image, so arriving at last frame's zoom would land you off the edge.
-    /// Shapes: the other way to author a relief. Painting a sprite texel by
-    /// texel is a lot of work for a shape the eye reads in one word, so this
-    /// half of the tool takes a region and a cross-section and works the
-    /// slopes out — the way the sprite tools people actually ship with do it.
-    fn shape_controls(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(10.0);
-        theme::section(ui, "Shape").on_hover_text(
-            "Select a region, say what it is, and the four edge heights follow \
-             from how far each texel sits from the region's edge.",
-        );
-
-        let loaded = self.loaded.is_some();
-        ui.horizontal_wrapped(|ui| {
-            if theme::tab(
-                ui,
-                self.relief.selecting,
-                "Select",
-                self.relief.has_selection(),
-            )
-            .on_hover_text(
-                "Click the canvas to select a region of the image by colour. \
-                     Shift-click adds to it. While this is on, the canvas does not paint.",
-            )
-            .clicked()
-            {
-                self.relief.selecting = !self.relief.selecting;
-                if self.relief.selecting && !matches!(self.view, View::Paint(_)) {
-                    self.show_side(self.relief.side);
-                }
-            }
-            if ui
-                .add_enabled(loaded, egui::Button::new("Sprite"))
-                .on_hover_text("Select everything the image is not transparent at")
-                .clicked()
-                && let Some(l) = &self.loaded
-            {
-                let src = l.source.clone();
-                self.relief.select_opaque(&src);
-                self.relief.selecting = true;
-            }
-            if ui.button("All").clicked() {
-                self.relief.select_all();
-            }
-            if ui
-                .add_enabled(self.relief.has_selection(), egui::Button::new("None"))
-                .clicked()
-            {
-                self.relief.clear_selection();
-            }
-        });
-
-        ui.add_enabled_ui(loaded, |ui| {
-            ui.add(
-                egui::Slider::new(&mut self.relief.tolerance, 0.0..=1.0)
-                    .fixed_decimals(2)
-                    .text("Tolerance"),
-            )
-            .on_hover_text(
-                "How far a colour can drift and still count as the same region. \
-                 0 selects one exact colour.",
-            );
-        });
-
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            for shape in Shape::ALL {
-                if theme::tab(ui, self.relief.cut.shape == shape, shape.label(), false)
-                    .on_hover_text(shape.hint())
-                    .clicked()
-                {
-                    self.relief.cut.shape = shape;
-                }
-            }
-        });
-
-        let cut = &mut self.relief.cut;
-        ui.add(
-            egui::Slider::new(&mut cut.peak, 0.0..=1.0)
-                .fixed_decimals(2)
-                .text("Peak"),
-        )
-        .on_hover_text("How high the deepest part of the region stands");
-        ui.add(
-            egui::Slider::new(&mut cut.floor, 0.0..=1.0)
-                .fixed_decimals(2)
-                .text("Floor"),
-        )
-        .on_hover_text("How high the region's edge stands");
-        if cut.shape.uses_width() {
-            ui.add(egui::Slider::new(&mut cut.width, 0.5..=32.0).text("Width"))
-                .on_hover_text("How many texels the ramp takes to reach the top");
-        }
-        ui.checkbox(&mut cut.concave, "Carve in")
-            .on_hover_text("Sink the shape into the surface instead of standing it out");
-
-        let count = self.relief.selected_count();
-        ui.add_space(4.0);
-        if ui
-            .add_enabled(
-                count > 0,
-                egui::Button::new(format!("Apply to {count} texels")),
-            )
-            .on_hover_text("Write the shape into all four canvases, as one undoable step")
-            .clicked()
-        {
-            let written = self.relief.apply_shape();
-            self.status = format!("{} shaped {written} texels.", self.relief.cut.shape.label());
-            self.show_side(self.relief.side);
-        }
-        if count == 0 {
-            ui.label(
-                egui::RichText::new("Nothing selected.")
-                    .small()
-                    .color(theme::palette(ui).text_weak),
-            );
-        }
-    }
-
     fn show_side(&mut self, side: Side) {
         self.relief.side = side;
         self.view = View::Paint(side);
@@ -923,11 +801,6 @@ impl App {
             if grid {
                 paint_texel_grid(ui, rect, viewport, self.zoom);
             }
-
-            if relief_view && self.relief.has_selection() {
-                let (cw, ch) = self.relief.dims();
-                paint_selection(ui, rect, self.zoom, self.relief.selection(), cw, ch);
-            }
         });
     }
 
@@ -953,23 +826,9 @@ impl App {
             )
         });
 
-        // While the Select tab is on, the canvas picks regions instead. It is
-        // the same click on the same pixels, so the two cannot both be live.
-        if self.relief.selecting
-            && response.clicked()
-            && let Some(pos) = pointer
-            && let Some(l) = &self.loaded
-        {
-            let (x, y) = texel_at(pos);
-            let src = l.source.clone();
-            let add = ui.ctx().input(|i| i.modifiers.shift);
-            self.relief.select_at(&src, x, y, add);
-        }
-
         // Painting from the canvas keeps going while the button is held, even
         // once the pointer has wandered off the edge of the image.
-        let painting =
-            !self.relief.selecting && primary_down && response.is_pointer_button_down_on();
+        let painting = primary_down && response.is_pointer_button_down_on();
         if painting {
             if !self.relief.stroking() {
                 self.relief.begin_stroke();
@@ -1564,61 +1423,6 @@ fn ladder_step(zoom: f32, dir: i32) -> f32 {
 }
 
 /// One hairline per texel edge, drawn only over the visible part of the image.
-/// Outline the selection: only the edges where a selected texel meets an
-/// unselected one, so what you see is the region's border rather than a wash
-/// of colour over the art you are trying to look at.
-fn paint_selection(
-    ui: &egui::Ui,
-    image: egui::Rect,
-    zoom: f32,
-    selection: &[bool],
-    w: u32,
-    h: u32,
-) {
-    let painter = ui.painter();
-    let accent = theme::palette(ui).accent;
-    // Two strokes, light under dark: a single hairline disappears over art of
-    // its own colour, and marching ants would need an animation to be legible.
-    let under = egui::Stroke::new(3.0, egui::Color32::from_black_alpha(140));
-    let over = egui::Stroke::new(1.5, accent);
-    let at = |x: i32, y: i32| -> bool {
-        x >= 0
-            && y >= 0
-            && x < w as i32
-            && y < h as i32
-            && selection[(y as u32 * w + x as u32) as usize]
-    };
-
-    let mut segments = Vec::new();
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
-            if !at(x, y) {
-                continue;
-            }
-            let p = |cx: f32, cy: f32| image.min + egui::vec2(cx, cy) * zoom;
-            let (x0, y0, x1, y1) = (x as f32, y as f32, x as f32 + 1.0, y as f32 + 1.0);
-            if !at(x, y - 1) {
-                segments.push([p(x0, y0), p(x1, y0)]);
-            }
-            if !at(x, y + 1) {
-                segments.push([p(x0, y1), p(x1, y1)]);
-            }
-            if !at(x - 1, y) {
-                segments.push([p(x0, y0), p(x0, y1)]);
-            }
-            if !at(x + 1, y) {
-                segments.push([p(x1, y0), p(x1, y1)]);
-            }
-        }
-    }
-    for seg in &segments {
-        painter.line_segment(*seg, under);
-    }
-    for seg in &segments {
-        painter.line_segment(*seg, over);
-    }
-}
-
 fn paint_texel_grid(ui: &egui::Ui, image: egui::Rect, viewport: egui::Rect, zoom: f32) {
     let visible = image.intersect(viewport);
     if !visible.is_positive() {
