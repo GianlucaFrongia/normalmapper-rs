@@ -14,10 +14,14 @@ cargo run --release
 - **Open** images via dialog (`Ctrl/Cmd+O`) or by dropping a file on the window;
   PNG, JPEG, BMP, TGA, TIFF, WebP, GIF.
 - **Height extraction** from luminance, average RGB, or a single R/G/B/A channel,
-  with contrast, invert, and a Gaussian pre-blur to tame noise.
-- **Normal generation** with Sobel, Scharr, Prewitt or 1-texel kernels, a logarithmic
-  strength slider, flip X, flip Y (OpenGL/Bevy vs. DirectX/Unity green channel),
-  and seamless/tileable wrap sampling.
+  with contrast, invert, and a Gaussian pre-blur to tame noise. **Ignore
+  transparent** hands every see-through texel the height of the nearest opaque
+  one: a sprite's surround is whatever colour was left under the eraser, and
+  differentiating against it rings the silhouette in a cliff nobody drew.
+- **Normal generation** with Sobel, Scharr, Prewitt or 1-texel kernels, a
+  logarithmic strength slider, flip X, flip Y, and seamless/tileable wrap
+  sampling. Off, **Flip Y** is the OpenGL convention (+Y up — Unity, Godot,
+  Bevy, Blender); on, it is DirectX (+Y down — Unreal).
 - **Ambient occlusion** — horizon-based, marching eight directions over the
   height field; radius and amount sliders.
 - **Roughness** — a base level plus fine height detail isolated with a
@@ -78,6 +82,42 @@ cargo run --release
   monospace face, and the image lifted off a sunken well on a soft shadow.
   Light and dark differ only in their numbers.
 - Light/dark theme switch; generation time shown in the status bar.
+
+## Taking the maps to an engine
+
+The maps are only half the job; how they are imported decides whether they
+survive.
+
+- **Green channel.** OpenGL (+Y up) for Unity, Godot, Bevy and Blender —
+  leave **Flip Y** off. DirectX (+Y down) for Unreal — turn it on. A map in
+  the wrong convention does not error; every bump simply lights as a dent,
+  which is why there is a test asserting the top of a bump is the green half.
+- **Colour space.** A normal map is a vector packed into RGB, not a picture.
+  Import it as linear / Non-Color: Unity's *Normal map* texture type, Unreal's
+  *TC_Normalmap*, Godot with sRGB off. Read as sRGB it will be subtly, and
+  unfixably, wrong.
+- **Filtering.** For pixel art: point/nearest, no mipmaps, no lossy
+  compression. Saving a normal map as JPEG destroys it — the app says so if
+  you try.
+- **Wiring it up.** Unity 2D/URP takes the normal as a Sprite *Secondary
+  Texture* named `_NormalMap`, on a `Sprite-Lit-Default` material with a
+  `Light2D` in the scene. Godot 4 wants a `CanvasTexture` with `texture_normal`
+  (and `texture_specular`) under a `PointLight2D`.
+- **AO and roughness are 3D-shaped.** 2D lit pipelines mostly have nowhere to
+  put them: Godot's `CanvasTexture` takes a specular map rather than a
+  roughness one, and Unity 2D has no AO slot at all. The usual answer is to
+  multiply AO into the albedo at bake time and use roughness to author the
+  specular map. They are exported because the lit preview shades with them,
+  and because 3D material workflows do take all four.
+- **Hand-paint, don't infer.** For sprites the luminance path is a first draft
+  at best — colour is paint, not depth, and a dark outline is not a trench.
+  That is what the relief is for, and it is how lit pixel art is actually
+  authored.
+
+The **lit preview** shades the way an engine does rather than the way that is
+cheapest: lighting in linear space and encoding on the way out, ambient
+occlusion applied to the ambient term only, and specular gated on N·L so a face
+turned away from the light cannot catch a highlight.
 
 ## Layout
 

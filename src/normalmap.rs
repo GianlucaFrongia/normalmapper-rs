@@ -116,6 +116,9 @@ pub struct Settings {
     pub flip_y: bool,
     /// Sample across the borders so the result tiles seamlessly.
     pub tileable: bool,
+    /// Let transparent texels take the height of the nearest opaque one,
+    /// instead of whatever colour happens to sit under the eraser.
+    pub ignore_transparent: bool,
 
     /// Horizon search radius in pixels for ambient occlusion; 0 disables it.
     pub ao_radius: f32,
@@ -141,6 +144,7 @@ impl Default for Settings {
             flip_x: false,
             flip_y: false,
             tileable: false,
+            ignore_transparent: true,
             ao_radius: 8.0,
             ao_strength: 1.0,
             roughness_base: 0.4,
@@ -257,6 +261,15 @@ pub fn height_map(src: &RgbaImage, settings: &Settings) -> HeightMap {
         })
         .collect();
 
+    // A sprite's transparent surround is not part of its shape. Its RGB is
+    // whatever was left under the eraser — usually black — so differentiating
+    // against it rings the silhouette in a cliff the artist never drew. Give
+    // those texels the height of the nearest opaque one and the edge goes
+    // flat, which is what "there is nothing here" should look like.
+    if settings.ignore_transparent && settings.source != HeightSource::Alpha {
+        flood_from_opaque(&mut data, src, width, height);
+    }
+
     if settings.blur > 0.0 {
         data = gaussian_blur(&data, width, height, settings.blur, settings.tileable);
     }
@@ -265,6 +278,43 @@ pub fn height_map(src: &RgbaImage, settings: &Settings) -> HeightMap {
         width,
         height,
         data,
+    }
+}
+
+/// Replace every transparent texel's height with that of the nearest opaque
+/// one, breadth-first, so the distance is a real nearest-neighbour distance
+/// rather than whichever way a scan happened to run.
+fn flood_from_opaque(data: &mut [f32], src: &RgbaImage, w: u32, h: u32) {
+    let (wi, hi) = (w as i32, h as i32);
+    let mut settled: Vec<bool> = src.pixels().map(|px| px.0[3] > 0).collect();
+    // Nothing to do if the image is fully opaque, and nothing we *can* do if
+    // it is fully transparent: there is no height to spread.
+    if settled.iter().all(|&o| o) || settled.iter().all(|&o| !o) {
+        return;
+    }
+
+    let mut frontier: Vec<u32> = (0..settled.len() as u32)
+        .filter(|&i| settled[i as usize])
+        .collect();
+    let mut next = Vec::new();
+    while !frontier.is_empty() {
+        for &i in &frontier {
+            let (x, y) = ((i % w) as i32, (i / w) as i32);
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (nx, ny) = (x + dx, y + dy);
+                if nx < 0 || ny < 0 || nx >= wi || ny >= hi {
+                    continue;
+                }
+                let j = (ny * wi + nx) as usize;
+                if !settled[j] {
+                    settled[j] = true;
+                    data[j] = data[i as usize];
+                    next.push(j as u32);
+                }
+            }
+        }
+        frontier.clear();
+        std::mem::swap(&mut frontier, &mut next);
     }
 }
 
@@ -299,7 +349,12 @@ pub fn normal_map(hm: &HeightMap, settings: &Settings) -> RgbaImage {
                 dx *= norm * strength;
                 dy *= norm * strength;
 
-                let (nx, ny, nz) = (-dx * sx, -dy * sy, 1.0);
+                // `dy` runs down the image, because that is the way rows go.
+                // +Y in an OpenGL normal map runs up it, so the vertical slope
+                // is negated once by the axis flip and once by pointing the
+                // normal away from the slope — that is, not at all. `flip_y`
+                // turns the result into the DirectX convention.
+                let (nx, ny, nz) = (-dx * sx, dy * sy, 1.0);
                 let len = (nx * nx + ny * ny + nz * nz).sqrt();
 
                 let o = x * 4;
@@ -510,23 +565,56 @@ pub fn shade(s: &Shading, light: &Light) -> RgbaImage {
                 let diffuse = dot(n, l).max(0.0);
                 // Rough surfaces get a wide, weak highlight; smooth ones a tight one.
                 let shininess = 2.0 + (1.0 - rough).powi(2) * 128.0;
-                let spec = dot(n, half).max(0.0).powf(shininess) * light.specular * (1.0 - rough);
+                // A half-vector alone will happily put a highlight on a face
+                // turned away from the light. Gate it on N·L, as an engine does.
+                let spec = if diffuse > 0.0 {
+                    dot(n, half).max(0.0).powf(shininess) * light.specular * (1.0 - rough)
+                } else {
+                    0.0
+                };
 
                 let o = x * 4;
                 for c in 0..3 {
                     let albedo = if light.use_albedo {
-                        s.albedo.as_raw()[i * 4 + c] as f32 / 255.0
+                        srgb_to_linear(s.albedo.as_raw()[i * 4 + c] as f32 / 255.0)
                     } else {
-                        0.8
+                        srgb_to_linear(0.8)
                     };
-                    let v = albedo * (light.ambient * ao + diffuse * ao) + spec;
-                    row[o + c] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    // Ambient occlusion occludes the ambient term. Direct light
+                    // arrives along a known direction and is not what the
+                    // horizon search measured.
+                    let v = albedo * (light.ambient * ao + diffuse) + spec;
+                    row[o + c] = (linear_to_srgb(v.max(0.0)).clamp(0.0, 1.0) * 255.0).round() as u8;
                 }
-                row[o + 3] = 255;
+                // Keep the sprite's cut-out: a transparent texel is not a black
+                // one, and the checkerboard behind the preview should show.
+                row[o + 3] = s.albedo.as_raw()[i * 4 + 3];
             }
         });
 
     RgbaImage::from_raw(w, h, buf).expect("buffer matches dimensions")
+}
+
+/// Engines light in linear space and encode on the way out. Doing the same
+/// here is the difference between a preview that predicts the engine and one
+/// that merely looks plausible: sRGB-space lighting washes mid-tones out and
+/// flattens exactly the shading a normal map is judged by.
+#[inline]
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
 }
 
 #[inline]
@@ -575,6 +663,120 @@ mod tests {
         let px = nm.get_pixel(4, 4).0;
         assert!(px[0] < 120, "expected -X tilt, got {px:?}");
         assert_eq!(px[1], 128);
+    }
+
+    /// A round bump: bright in the middle, falling off to the edges.
+    fn bump(n: u32) -> RgbaImage {
+        let mut img = RgbaImage::new(n, n);
+        let c = (n as f32 - 1.0) / 2.0;
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let (dx, dy) = (x as f32 - c, y as f32 - c);
+            let r = (dx * dx + dy * dy).sqrt() / c;
+            let v = ((1.0 - r).max(0.0) * 255.0) as u8;
+            *px = Rgba([v, v, v, 255]);
+        }
+        img
+    }
+
+    /// The convention itself, stated as geometry: the far slope of a hill
+    /// faces away from you, so on an OpenGL map the top of a bump is the
+    /// green half. Getting this backwards makes every bump read as a dent,
+    /// and nothing else in the pipeline notices.
+    #[test]
+    fn a_bump_faces_up_at_its_top() {
+        let n = 64;
+        let gl = Settings::default();
+        let nm = normal_map(&height_map(&bump(n), &gl), &gl);
+        let top = nm.get_pixel(n / 2, n / 4).0[1];
+        let bottom = nm.get_pixel(n / 2, 3 * n / 4).0[1];
+        assert!(top > 136, "OpenGL: the top of a bump faces up, got {top}");
+        assert!(bottom < 120, "and its bottom faces down, got {bottom}");
+
+        let dx = Settings { flip_y: true, ..gl };
+        let nm = normal_map(&height_map(&bump(n), &dx), &dx);
+        assert!(
+            nm.get_pixel(n / 2, n / 4).0[1] < 120,
+            "DirectX is the other way round"
+        );
+    }
+
+    /// And the same thing seen through the preview, which is how anyone
+    /// actually notices: a light from the top of the screen lights the top.
+    #[test]
+    fn a_light_from_above_lights_the_top_of_a_bump() {
+        let n = 64;
+        let s = Settings::default();
+        let white = solid(n, n, 255);
+        let sh = Shading {
+            width: n,
+            height: n,
+            albedo: white.clone(),
+            normal: normal_map(&height_map(&bump(n), &s), &s),
+            ao: white,
+            roughness: solid(n, n, 128),
+        };
+        let lit = shade(
+            &sh,
+            &Light {
+                dir: [0.0, 0.8, 0.6],
+                specular: 0.0,
+                ..Light::default()
+            },
+        );
+        assert!(
+            lit.get_pixel(n / 2, n / 4).0[0] > lit.get_pixel(n / 2, 3 * n / 4).0[0],
+            "the lit preview renders the bump as a dent"
+        );
+    }
+
+    /// A half-vector will put a highlight on a face turned away from the
+    /// light unless something stops it.
+    #[test]
+    fn a_face_turned_away_gets_no_highlight() {
+        // Normals leaning hard -X, with the light off to +X.
+        let away = RgbaImage::from_pixel(4, 4, Rgba([0, 128, 130, 255]));
+        let s = Shading {
+            width: 4,
+            height: 4,
+            albedo: solid(4, 4, 255),
+            normal: away,
+            ao: solid(4, 4, 255),
+            roughness: solid(4, 4, 0),
+        };
+        let lit = shade(
+            &s,
+            &Light {
+                dir: [1.0, 0.0, 0.1],
+                ambient: 0.0,
+                specular: 1.0,
+                use_albedo: true,
+                flip_y: false,
+            },
+        );
+        assert_eq!(lit.get_pixel(2, 2).0[0], 0, "backlit face should be black");
+    }
+
+    /// Transparent surroundings are not a wall around the sprite.
+    #[test]
+    fn a_transparent_surround_is_not_a_cliff() {
+        // A flat mid-grey square on a transparent black background.
+        let mut img = RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 0]));
+        for y in 4..12 {
+            for x in 4..12 {
+                img.put_pixel(x, y, Rgba([128, 128, 128, 255]));
+            }
+        }
+        let on = Settings::default();
+        let off = Settings {
+            ignore_transparent: false,
+            ..on
+        };
+        let edge = |s: &Settings| normal_map(&height_map(&img, s), s).get_pixel(4, 8).0[0] as i32;
+        assert_eq!(edge(&on), 128, "the silhouette should be flat");
+        assert!(
+            (edge(&off) - 128).abs() > 20,
+            "without the fix there is a cliff to see"
+        );
     }
 
     #[test]

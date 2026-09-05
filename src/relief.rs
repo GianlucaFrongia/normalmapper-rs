@@ -634,7 +634,10 @@ impl Relief {
             // the texel's edges were declared to be is what it is.
             let dx = (r - l) * depth;
             let dy = (b - t) * depth;
-            let (nx, ny, nz) = (-dx * sx, -dy * sy, 1.0);
+            // `dy` runs down the canvas and +Y runs up it, so the vertical
+            // slope keeps its sign where the horizontal one is negated. Same
+            // convention as the generator: off is OpenGL, `flip_y` is DirectX.
+            let (nx, ny, nz) = (-dx * sx, dy * sy, 1.0);
             let len = (nx * nx + ny * ny + nz * nz).sqrt();
             buf[i * 4] = encode(nx / len);
             buf[i * 4 + 1] = encode(ny / len);
@@ -737,6 +740,36 @@ mod tests {
         assert_eq!(px[1], 128);
         // And an untouched texel stays flat.
         assert_eq!(baked.normal.get_pixel(0, 0).0[..3], [128, 128, 255]);
+    }
+
+    /// The vertical half of the same promise, and the axis that is easy to
+    /// get backwards: a texel whose bottom edge stands higher than its top
+    /// slopes up as you go down, so its normal leans up the canvas.
+    #[test]
+    fn a_high_bottom_edge_leans_the_normal_up() {
+        let mut r = flat_relief();
+        r.begin_stroke();
+        r.side = Side::Bottom;
+        r.value = 1.0;
+        r.stamp(1, 1);
+        r.side = Side::Top;
+        r.value = 0.0;
+        r.stamp(1, 1);
+        r.end_stroke();
+
+        let baked = r.bake(&Settings::default(), None);
+        let px = baked.normal.get_pixel(1, 1);
+        assert!(px[1] > 128, "expected an up-leaning normal, got {px:?}");
+        assert_eq!(px[0], 128, "and nothing sideways");
+
+        let dx = Settings {
+            flip_y: true,
+            ..Settings::default()
+        };
+        assert!(
+            r.bake(&dx, None).normal.get_pixel(1, 1).0[1] < 128,
+            "DirectX is the other way round"
+        );
     }
 
     #[test]

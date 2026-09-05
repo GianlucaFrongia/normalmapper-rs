@@ -352,6 +352,11 @@ impl App {
                         );
                     ui.checkbox(&mut s.invert_height, "Invert height")
                         .on_hover_text("Treat dark pixels as peaks instead of valleys");
+                    ui.checkbox(&mut s.ignore_transparent, "Ignore transparent")
+                        .on_hover_text(
+                            "Transparent texels take the height of the nearest opaque one, \
+                             so a sprite's silhouette does not become a cliff",
+                        );
 
                     ui.add_space(10.0);
                     theme::section(ui, "Normals");
@@ -369,7 +374,10 @@ impl App {
                     );
                     ui.checkbox(&mut s.flip_x, "Flip X");
                     ui.checkbox(&mut s.flip_y, "Flip Y (DirectX)")
-                        .on_hover_text("Off: OpenGL / Bevy (+Y up). On: DirectX / Unity (+Y down)");
+                        .on_hover_text(
+                            "Off: OpenGL (+Y up) — Unity, Godot, Bevy, Blender.\n\
+                             On: DirectX (+Y down) — Unreal.",
+                        );
                     ui.checkbox(&mut s.tileable, "Seamless / tileable")
                         .on_hover_text("Wrap sampling across the borders");
 
@@ -1269,7 +1277,17 @@ impl App {
             },
             View::Source => return,
         };
+        // JPEG resamples chroma and rounds every channel it feels like: fine
+        // for an albedo, ruinous for a vector packed into RGB.
+        let lossy = matches!(self.view, View::Map(MapKind::Normal) | View::Relief)
+            && path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"));
         self.status = match out.save(&path) {
+            Ok(()) if lossy => format!(
+                "Saved {} — but JPEG will corrupt a normal map. Use PNG or TGA.",
+                path.display()
+            ),
             Ok(()) => format!("Saved {}", path.display()),
             Err(err) => format!("Failed to save {}: {err}", path.display()),
         };
