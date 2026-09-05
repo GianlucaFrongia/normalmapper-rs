@@ -58,6 +58,24 @@ cargo run --release
   heights back off it). Drag to paint, right-drag to pan. Paint with no image
   open at all, or let a newly opened image size the canvas for you (capped at
   512 a side).
+- **Shapes** — the other way to author a relief, and the way the sprite tools
+  people actually ship with do it: select a region, say what it *is*, and the
+  slopes follow. **Sprite** selects everything the image is not transparent at,
+  or click the canvas to magic-wand a region of one colour (shift-click adds,
+  and a Tolerance slider says how far a colour may drift). Then pick a
+  cross-section — Flat, Dome, Cone, Bevel, Round bevel, or a tube lying across
+  or standing up — set how high its Peak and Floor stand, and **Carve in** to
+  sink it instead. One click bevels a whole sprite.
+
+  It is one idea applied seven ways: measure how far each texel sits from the
+  edge of its region (an exact Euclidean distance transform, or a one-axis one
+  for the tubes), turn that distance into a height with a profile curve, and
+  sample the curve at the midpoints of the texel's four edges. Sampling half a
+  texel out is what lets the shapes land in the same four canvases the brush
+  paints — a dome's rim texel gets a genuinely different left and right height,
+  so it has a slope to light rather than the flat plateau one height per texel
+  would give it. The result is ordinary painted heights: keep the parts you
+  like and paint over the rest, and the whole shape comes off in one Undo.
 - **Lit preview** — a column down the right of the window that Blinn-Phong
   shades the normal, AO and roughness maps together, with a drag-to-aim light
   ball plus ambient, specular and albedo controls. The only honest way to judge
@@ -114,6 +132,13 @@ survive.
   That is what the relief is for, and it is how lit pixel art is actually
   authored.
 
+**Height is not brightness.** A normal map is a field of directions, so light
+answers a texel's *slope*, never its elevation: a region painted all one height
+is a plateau, and a plateau is flat whether it stands at 10% or 100%. What
+lights is the difference between a texel's edges — which is why a shape's rim
+is where its shading lives, and why AO is the only map here that height alone
+moves.
+
 The **lit preview** shades the way an engine does rather than the way that is
 cheapest: lighting in linear space and encoding on the way out, ambient
 occlusion applied to the ambient term only, and specular gated on N·L so a face
@@ -128,8 +153,11 @@ turned away from the light cannot catch a highlight.
 - `src/batch.rs` — the folder-conversion window and its worker.
 - `src/light.rs` — the lit-preview column and the light-direction ball.
 - `src/relief.rs` — the four hand-painted edge-height canvases, the brush and
-  its undo history, and the bake that turns four numbers per texel into a
-  normal map (unit-tested: `cargo test`).
+  its undo history, the selection, and the bake that turns four numbers per
+  texel into a normal map (unit-tested: `cargo test`).
+- `src/shape.rs` — the distance transforms, the profile curves they are read
+  through, and the magic wand. No UI, no egui: given a region and a
+  cross-section it hands back four edge heights per texel (unit-tested).
 - `src/theme.rs` — the look: the palettes, the style they are installed as, and
   the few widgets egui has no stock version of (a section rule, a pill tab, the
   well the image sits in, and the relief tools' icons).

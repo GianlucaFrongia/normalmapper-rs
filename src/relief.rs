@@ -16,6 +16,7 @@ use eframe::egui;
 use image::{Rgba, RgbaImage};
 
 use crate::normalmap::{self, HeightMap, MapKind, Settings, Shading};
+use crate::shape::{self, Cut};
 use crate::theme;
 
 /// The height of a texel nobody has painted: flat, halfway up the range.
@@ -134,9 +135,18 @@ impl Tool {
 }
 
 /// One stroke, as the texels it changed: enough to undo it and to put it back.
+/// A brush stroke stays on one canvas, but a shape writes all four at once and
+/// has to come back off in a single press of Undo.
 struct Edit {
-    side: Side,
-    changes: Vec<(usize, Option<u8>, Option<u8>)>,
+    changes: Vec<(Side, usize, Option<u8>, Option<u8>)>,
+}
+
+impl Edit {
+    /// The canvas to show when this edit is undone. Undoing something you
+    /// cannot see is worse than not undoing it.
+    fn side(&self) -> Option<Side> {
+        self.changes.first().map(|&(side, ..)| side)
+    }
 }
 
 /// Everything the four canvases turn into, rebuilt on every change.
@@ -172,11 +182,23 @@ pub struct Relief {
     /// back to check them against the art underneath.
     pub opacity: f32,
 
+    /// The region the next shape applies to. Empty means nothing is selected,
+    /// which is different from everything being selected: a shape with no
+    /// region is a no-op, not a canvas-wide dome.
+    selection: Vec<bool>,
+    /// Whether clicking the canvas picks a region instead of painting on it.
+    pub selecting: bool,
+    /// How far a colour can drift and still count as the same region.
+    pub tolerance: f32,
+    /// The shape the Apply button would stamp into the selection.
+    pub cut: Cut,
+
     undo: Vec<Edit>,
     redo: Vec<Edit>,
     stroke: Option<Edit>,
-    /// Texels already recorded in the stroke in progress, so a brush that
-    /// passes over the same place twice still undoes to where it started.
+    /// Texels already recorded in the stroke in progress, one flag per side
+    /// per texel, so a brush that passes over the same place twice still
+    /// undoes to where it started.
     touched: Vec<bool>,
     last_texel: Option<(i32, i32)>,
 
@@ -204,10 +226,14 @@ impl Default for Relief {
             new_size: [DEFAULT_SIDE, DEFAULT_SIDE],
             reference: 0.6,
             opacity: 1.0,
+            selection: vec![false; n],
+            selecting: false,
+            tolerance: 0.05,
+            cut: Cut::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             stroke: None,
-            touched: vec![false; n],
+            touched: vec![false; n * 4],
             last_texel: None,
             revision: 0,
             dirty: true,
@@ -283,7 +309,9 @@ impl Relief {
         }
         self.width = w;
         self.height = h;
-        self.touched = vec![false; n];
+        self.touched = vec![false; n * 4];
+        // A selection names texels by index, and the indices have all moved.
+        self.selection = vec![false; n];
         self.new_size = [w, h];
         // The old strokes name texels that may no longer exist.
         self.undo.clear();
@@ -316,6 +344,86 @@ impl Relief {
     }
 }
 
+// ------------------------------------------------------------ the selection
+
+impl Relief {
+    /// Is anything selected? A shape needs somewhere to go.
+    pub fn has_selection(&self) -> bool {
+        self.selection.iter().any(|&s| s)
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.selection.iter().filter(|&&s| s).count()
+    }
+
+    pub fn selection(&self) -> &[bool] {
+        &self.selection
+    }
+
+    pub fn clear_selection(&mut self) {
+        if self.has_selection() {
+            self.selection = vec![false; (self.width * self.height) as usize];
+            self.mark();
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        self.selection = vec![true; (self.width * self.height) as usize];
+        self.mark();
+    }
+
+    /// Everything the sprite covers — the one selection worth a button of its
+    /// own, because a whole-silhouette bevel is most of what these tools get
+    /// used for.
+    pub fn select_opaque(&mut self, src: &RgbaImage) {
+        self.set_selection(shape::select_opaque(src, self.width, self.height), false);
+    }
+
+    /// The magic wand: the contiguous run of one colour under the pointer.
+    pub fn select_at(&mut self, src: &RgbaImage, x: i32, y: i32, add: bool) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        let picked = shape::select_similar(
+            src,
+            self.width,
+            self.height,
+            x as u32,
+            y as u32,
+            self.tolerance,
+        );
+        self.set_selection(picked, add);
+    }
+
+    fn set_selection(&mut self, picked: Vec<bool>, add: bool) {
+        if add {
+            for (dst, src) in self.selection.iter_mut().zip(picked) {
+                *dst |= src;
+            }
+        } else {
+            self.selection = picked;
+        }
+        self.mark();
+    }
+
+    /// Stamp the current shape into the selection, as one undoable edit.
+    /// Returns how many texels it wrote.
+    pub fn apply_shape(&mut self) -> usize {
+        let cells = shape::rasterize(&self.selection, self.width, self.height, &self.cut);
+        let mut written = 0;
+        self.begin_stroke();
+        for (i, cell) in cells.into_iter().enumerate() {
+            let Some(edges) = cell else { continue };
+            written += 1;
+            for side in Side::ALL {
+                self.write_at(side, i, Some(edges[side.index()]));
+            }
+        }
+        self.end_stroke();
+        written
+    }
+}
+
 // ---------------------------------------------------------------- the brush
 
 impl Relief {
@@ -325,7 +433,6 @@ impl Relief {
 
     pub fn begin_stroke(&mut self) {
         self.stroke = Some(Edit {
-            side: self.side,
             changes: Vec::new(),
         });
         self.touched.iter_mut().for_each(|t| *t = false);
@@ -341,11 +448,11 @@ impl Relief {
             return;
         }
         // Where every touched texel actually ended up, now that it has.
-        let canvas = &self.canvases[edit.side.index()];
         for change in &mut edit.changes {
-            change.2 = canvas[change.0];
+            change.3 = self.canvases[change.0.index()][change.1];
         }
-        edit.changes.retain(|&(_, before, after)| before != after);
+        edit.changes
+            .retain(|&(_, _, before, after)| before != after);
         if edit.changes.is_empty() {
             return;
         }
@@ -477,15 +584,16 @@ impl Relief {
             return;
         }
         self.canvases[side.index()][i] = value;
+        let flag = side.index() * self.canvases[0].len() + i;
         if let Some(stroke) = &mut self.stroke
-            && !self.touched[i]
+            && !self.touched[flag]
         {
             // Only the value the texel started at is recorded here; where it
             // ended up is read back once, when the stroke finishes. A wide
             // brush crosses the same texel many times, and rescanning the
             // list each time would make a long stroke quadratic.
-            self.touched[i] = true;
-            stroke.changes.push((i, before, value));
+            self.touched[flag] = true;
+            stroke.changes.push((side, i, before, value));
         }
         self.mark();
     }
@@ -502,24 +610,27 @@ impl Relief {
         !self.redo.is_empty()
     }
 
-    /// Undo the last stroke, and select the side it was on — undoing
-    /// something you cannot see is worse than not undoing it.
+    /// Undo the last stroke, and select a side it was on.
     pub fn undo(&mut self) {
         let Some(edit) = self.undo.pop() else { return };
-        for &(i, before, _) in &edit.changes {
-            self.canvases[edit.side.index()][i] = before;
+        for &(side, i, before, _) in &edit.changes {
+            self.canvases[side.index()][i] = before;
         }
-        self.side = edit.side;
+        if let Some(side) = edit.side() {
+            self.side = side;
+        }
         self.redo.push(edit);
         self.mark();
     }
 
     pub fn redo(&mut self) {
         let Some(edit) = self.redo.pop() else { return };
-        for &(i, _, after) in &edit.changes {
-            self.canvases[edit.side.index()][i] = after;
+        for &(side, i, _, after) in &edit.changes {
+            self.canvases[side.index()][i] = after;
         }
-        self.side = edit.side;
+        if let Some(side) = edit.side() {
+            self.side = side;
+        }
         self.undo.push(edit);
         self.mark();
     }
@@ -770,6 +881,59 @@ mod tests {
             r.bake(&dx, None).normal.get_pixel(1, 1).0[1] < 128,
             "DirectX is the other way round"
         );
+    }
+
+    /// A shape writes all four canvases, and has to come back off in one
+    /// press: an artist who has to hit Undo four times will stop trusting it.
+    #[test]
+    fn a_shape_applies_and_undoes_as_one_step() {
+        let mut r = Relief::default();
+        r.resize(16, 16);
+        r.select_all();
+        r.cut.shape = crate::shape::Shape::Dome;
+        assert!(r.apply_shape() > 0);
+        assert!(
+            Side::ALL.iter().all(|&s| r.drawn(s)),
+            "all four are written"
+        );
+
+        r.undo();
+        assert!(!r.has_content(), "and all four come back off together");
+        r.redo();
+        assert!(Side::ALL.iter().all(|&s| r.drawn(s)));
+    }
+
+    /// The end of the chain: a dome laid down as edge heights bakes to a
+    /// normal map whose rims lean outwards, which is what makes it read as
+    /// round when a light goes past.
+    #[test]
+    fn a_domes_rims_lean_apart() {
+        let mut r = Relief::default();
+        r.resize(16, 16);
+        r.select_all();
+        r.cut.shape = crate::shape::Shape::Dome;
+        r.apply_shape();
+
+        let baked = r.bake(&Settings::default(), None);
+        let left = baked.normal.get_pixel(0, 8).0[0];
+        let right = baked.normal.get_pixel(15, 8).0[0];
+        let top = baked.normal.get_pixel(8, 0).0[1];
+        let bottom = baked.normal.get_pixel(8, 15).0[1];
+        assert!(left < 128, "the left rim faces left, got {left}");
+        assert!(right > 128, "the right rim faces right, got {right}");
+        assert!(top > 128, "the top rim faces up, got {top}");
+        assert!(bottom < 128, "the bottom rim faces down, got {bottom}");
+    }
+
+    /// A selection names texels by index, so it cannot outlive a resize.
+    #[test]
+    fn resizing_drops_the_selection() {
+        let mut r = Relief::default();
+        r.resize(16, 16);
+        r.select_all();
+        assert_eq!(r.selected_count(), 256);
+        r.resize(8, 8);
+        assert_eq!(r.selected_count(), 0);
     }
 
     #[test]
